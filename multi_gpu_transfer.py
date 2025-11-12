@@ -33,7 +33,8 @@ def init_dist():
     torch.cuda.set_device(local_rank)
 
     # init NCCL/RCCL backend
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="gloo")
+    node_rank = rank // gpus_per_node   
 
     # pair GPU i on node 0 with GPU i on node 1
     peer_node = 1 - node_rank
