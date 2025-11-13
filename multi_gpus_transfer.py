@@ -1,12 +1,11 @@
 import os
-import json
 import time
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from uccl import p2p  # this matches benchmark_uccl_write.py style
+from uccl import p2p  # matches your benchmark_uccl_write.py
 
 
 # ============================================================
@@ -178,12 +177,13 @@ def recv_bytes(src_rank: int) -> bytes:
 
 
 # ============================================================
-#  UCCL p2p endpoint setup (aligned w/ benchmark_uccl_write)
+#  UCCL p2p endpoint setup (aligned with benchmark_uccl_write)
 # ============================================================
 
 def setup_endpoint(local_gpu_idx: int, num_cpus: int = 1):
     """
     Create a p2p.Endpoint bound to a given local GPU.
+    Matches: ep = p2p.Endpoint(args.local_gpu_idx, args.num_cpus)
     """
     ep = p2p.Endpoint(local_gpu_idx, num_cpus)
     return ep
@@ -202,7 +202,8 @@ def setup_p2p_connection(ep, node_rank, peer_rank):
 
     - Client:
         remote_md = recv_bytes(peer_rank)
-        ip, port, r_gpu = p2p.Endpoint.parse_metadata(remote_md)
+        ip, port, r_gpu = p2p.parse_metadata(remote_md) OR
+                          p2p.Endpoint.parse_metadata(remote_md)
         ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
     """
     rank = dist.get_rank()
@@ -214,7 +215,6 @@ def setup_p2p_connection(ep, node_rank, peer_rank):
         send_bytes(peer_rank, local_md)
 
         print(f"[R{rank}] waiting for ep.accept()", flush=True)
-        # signature from benchmark style: ok, ip, r_gpu, conn_id = ep.accept()
         ok, r_ip, r_gpu, conn_id = ep.accept()
         assert ok, f"[R{rank}] ep.accept() failed"
         print(
@@ -226,9 +226,13 @@ def setup_p2p_connection(ep, node_rank, peer_rank):
         print(f"[R{rank}] waiting to recv endpoint metadata from R{peer_rank}", flush=True)
         remote_md = recv_bytes(peer_rank)
 
-        # In the benchmark, parse_metadata is typically a classmethod
-        # Endpoint.parse_metadata(remote_md) -> (ip, port, r_gpu)
-        ip, port, r_gpu = p2p.Endpoint.parse_metadata(remote_md)
+        # parse_metadata can live as a module-level or class-level function.
+        if hasattr(p2p, "parse_metadata"):
+            ip, port, r_gpu = p2p.parse_metadata(remote_md)
+        elif hasattr(p2p.Endpoint, "parse_metadata"):
+            ip, port, r_gpu = p2p.Endpoint.parse_metadata(remote_md)
+        else:
+            raise RuntimeError("No parse_metadata found in uccl.p2p")
 
         print(f"[R{rank}] connecting to {ip}:{port} gpu={r_gpu}", flush=True)
         ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
@@ -239,7 +243,7 @@ def setup_p2p_connection(ep, node_rank, peer_rank):
 
 
 # ============================================================
-#  Main one-shot weight transfer per GPU pair
+#  One-shot weight transfer per GPU pair, using advertisev + write_async
 # ============================================================
 
 def run_transfer(rank, local_rank, node_rank, peer_rank):
@@ -249,10 +253,10 @@ def run_transfer(rank, local_rank, node_rank, peer_rank):
     - Build same ToyPolicyNet on both sides.
     - Compute flat layout over weights.
     - Use UCCL p2p.Endpoint to:
-        * Server (node_rank=1): allocate GPU weight buffer, reg+advertise,
-          send fifo_blob to client.
+        * Server (node_rank=1): allocate GPU weight buffer, reg + advertisev,
+          send fifo_blob_v[0] to client.
         * Client (node_rank=0): pack model -> flat buffer, reg it, recv fifo_blob,
-          call write_async(conn_id, mr_id, ptr, size, fifo_blob).
+          call write_async(conn_id, mr_id_v[0], ptr_v[0], size_v[0], fifo_blob_v[0]).
     - On server, unpack received flat buffer into its model.
     """
     device = torch.device("cuda", local_rank)
@@ -284,7 +288,8 @@ def run_transfer(rank, local_rank, node_rank, peer_rank):
     # 3) Setup connection with peer via UCCL p2p
     conn_id = setup_p2p_connection(ep, node_rank, peer_rank)
 
-    # 4) Role split: node_rank=1 is the "receiver", node_rank=0 is "sender"
+    num_iovs = 1  # single contiguous region
+
     if node_rank == 1:
         # ============== RECEIVER NODE ==============
         print(f"[R{rank}] acting as RECEIVER for peer R{peer_rank}", flush=True)
@@ -293,24 +298,40 @@ def run_transfer(rank, local_rank, node_rank, peer_rank):
         weights_buf = torch.empty(total_elems, dtype=torch.float32, device=device)
         weights_bytes = weights_buf.view(torch.uint8)
         nbytes = weights_bytes.numel()
-
         ptr = int(weights_bytes.data_ptr())
+
+        mr_id_v = []
+        ptr_v = []
+        size_v = []
+
         ok, mr_id = ep.reg(ptr, nbytes)
         assert ok, f"[R{rank}] ep.reg() failed"
-        print(f"[R{rank}] reg OK: mr_id={mr_id}, nbytes={nbytes}", flush=True)
+        mr_id_v.append(mr_id)
+        ptr_v.append(ptr)
+        size_v.append(nbytes)
 
-        # Advertise this memory to peer: get fifo_blob describing remote location
-        ok, fifo_blob = ep.advertise(conn_id, mr_id, ptr, nbytes)
-        # If your benchmark uses advertisev(...) for vectors, adapt here.
-        assert ok, f"[R{rank}] ep.advertise() failed"
-        assert isinstance(fifo_blob, (bytes, bytearray)), \
-            f"fifo_blob must be bytes, got {type(fifo_blob)}"
         print(
-            f"[R{rank}] advertise OK, fifo_blob_len={len(fifo_blob)}",
+            f"[R{rank}] reg OK: mr_id={mr_id}, nbytes={nbytes}",
             flush=True,
         )
 
-        # Send fifo_blob to peer over torch.distributed
+        # Advertise this memory to peer via advertisev
+        ok, fifo_blob_v = ep.advertisev(conn_id, mr_id_v, ptr_v, size_v, num_iovs)
+        assert ok, f"[R{rank}] ep.advertisev() failed"
+        assert isinstance(fifo_blob_v, (list, tuple)), \
+            f"fifo_blob_v must be a list/tuple, got {type(fifo_blob_v)}"
+        assert len(fifo_blob_v) == num_iovs
+
+        fifo_blob = fifo_blob_v[0]
+        assert isinstance(fifo_blob, (bytes, bytearray)), \
+            f"fifo_blob must be bytes, got {type(fifo_blob)}"
+
+        print(
+            f"[R{rank}] advertisev OK, fifo_blob_len={len(fifo_blob)}",
+            flush=True,
+        )
+
+        # Send fifo_blob[0] to peer over torch.distributed
         send_bytes(peer_rank, fifo_blob)
         print(f"[R{rank}] sent fifo_blob to R{peer_rank}", flush=True)
 
@@ -341,12 +362,25 @@ def run_transfer(rank, local_rank, node_rank, peer_rank):
         nbytes = flat_bytes.numel()
         ptr = int(flat_bytes.data_ptr())
 
+        mr_id_v = []
+        ptr_v = []
+        size_v = []
+
         ok, mr_id = ep.reg(ptr, nbytes)
         assert ok, f"[R{rank}] ep.reg() failed"
-        print(f"[R{rank}] reg OK: mr_id={mr_id}, nbytes={nbytes}", flush=True)
+        mr_id_v.append(mr_id)
+        ptr_v.append(ptr)
+        size_v.append(nbytes)
+
+        print(
+            f"[R{rank}] reg OK: mr_id={mr_id}, nbytes={nbytes}",
+            flush=True,
+        )
 
         # Receive fifo_blob from peer describing the remote memory
         fifo_blob = recv_bytes(peer_rank)
+        fifo_blob_v = [fifo_blob]
+
         print(
             f"[R{rank}] got fifo_blob from R{peer_rank}, len={len(fifo_blob)}",
             flush=True,
@@ -354,7 +388,9 @@ def run_transfer(rank, local_rank, node_rank, peer_rank):
 
         # Perform the actual RDMA write via write_async
         t0 = time.time()
-        ok, transfer_id = ep.write_async(conn_id, mr_id, ptr, nbytes, fifo_blob)
+        ok, transfer_id = ep.write_async(
+            conn_id, mr_id_v[0], ptr_v[0], size_v[0], fifo_blob_v[0]
+        )
         assert ok, f"[R{rank}] ep.write_async() failed"
 
         # Poll until done
