@@ -3,17 +3,118 @@ import time
 import json
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 
-import uccl  # must be the ROCm+P2P-enabled UCCL wheel
+import uccl  # UCCL P2P-enabled ROCm wheel must be installed
 
 
-COMMIT_BYTE = 0xC3  # arbitrary single-byte commit marker
+COMMIT_BYTE = 0xC3  # arbitrary commit marker
 
 
-# -------------------------
-# Distributed setup helpers
-# -------------------------
+# ==========================
+#  Model + packing utilities
+# ==========================
+
+class ToyPolicyNet(nn.Module):
+    """
+    Tiny stand-in for an RL policy network.
+    Replace this with your actual RL model later.
+    """
+    def __init__(self, obs_dim=128, hidden_dim=256, action_dim=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def build_layout_from_state_dict(state_dict):
+    """
+    Build a deterministic layout over the model's parameters.
+
+    Assumes all tensors are float32 for simplicity.
+    Returns:
+      layout = {
+        "items": [
+           {"name": ..., "shape": [...], "numel": ...},
+           ...
+        ],
+        "total_elems": int
+      }
+    """
+    items = []
+    total_elems = 0
+
+    # Sort by key to guarantee consistent order
+    for name, tensor in sorted(state_dict.items()):
+        assert tensor.dtype == torch.float32, (
+            f"Only float32 tensors supported in this demo; {name} is {tensor.dtype}"
+        )
+        numel = tensor.numel()
+        items.append({
+            "name": name,
+            "shape": list(tensor.shape),
+            "numel": numel,
+        })
+        total_elems += numel
+
+    return {"items": items, "total_elems": total_elems}
+
+
+def pack_state_dict_inplace(model, layout, flat_buffer):
+    """
+    Fill 'flat_buffer' (1D float32 GPU tensor) with model params
+    according to 'layout'.
+
+    flat_buffer must have size layout["total_elems"].
+    """
+    sd = model.state_dict()
+    offset = 0
+    for entry in layout["items"]:
+        name = entry["name"]
+        numel = entry["numel"]
+        shape = entry["shape"]
+        t = sd[name]
+        assert t.dtype == torch.float32
+        view = t.view(-1)
+        flat_buffer[offset:offset + numel].copy_(view)
+        offset += numel
+
+    assert offset == layout["total_elems"]
+    return flat_buffer
+
+
+def unpack_flat_to_state_dict(flat_buffer, model, layout):
+    """
+    Copy data from 'flat_buffer' (1D float32 GPU tensor) back into model
+    according to 'layout'.
+    """
+    sd = model.state_dict()
+    offset = 0
+    for entry in layout["items"]:
+        name = entry["name"]
+        numel = entry["numel"]
+        shape = entry["shape"]
+
+        target = sd[name]
+        view = flat_buffer[offset:offset + numel].view(*shape)
+        # ensure device/dtype match (they should be float32 on GPU)
+        target.copy_(view.to(device=target.device, dtype=target.dtype))
+        offset += numel
+
+    assert offset == layout["total_elems"]
+
+
+# ==========================
+#   Distributed setup
+# ==========================
 
 def init_dist():
     """
@@ -32,15 +133,14 @@ def init_dist():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     gpus_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 
-    # Each process gets its own GPU
+    # Each process uses one GPU (ROCm-backed under torch.cuda)
     torch.cuda.set_device(local_rank)
 
-    # Metadata/control only => gloo is fine
+    # We only use dist for metadata → gloo (CPU) is fine
     dist.init_process_group(backend="gloo")
 
-    assert world_size % gpus_per_node == 0, (
+    assert world_size % gpus_per_node == 0, \
         f"world_size={world_size} not divisible by gpus_per_node={gpus_per_node}"
-    )
     nnodes = world_size // gpus_per_node
     assert nnodes == 2, f"This script assumes exactly 2 nodes, got nnodes={nnodes}"
 
@@ -63,9 +163,9 @@ def init_dist():
     return rank, world_size, local_rank, node_rank, gpus_per_node, peer_rank
 
 
-# -------------------------
-# Metadata send/recv (CPU)
-# -------------------------
+# ==========================
+#   Metadata send / recv
+# ==========================
 
 def send_bytes(dst_rank: int, payload: bytes):
     """
@@ -97,9 +197,9 @@ def recv_bytes(src_rank: int) -> bytes:
     return bytes(buf.tolist())
 
 
-# -------------------------
-# UCCL helper
-# -------------------------
+# ==========================
+#        UCCL helper
+# ==========================
 
 def try_write(conn, local_ptr: int, remote_md, nbytes: int, remote_off: int):
     """
@@ -117,50 +217,78 @@ def try_write(conn, local_ptr: int, remote_md, nbytes: int, remote_off: int):
         uccl.write(conn, remote_md, int(local_ptr), int(nbytes), int(remote_off))
 
 
-# -------------------------
-# Main transfer logic
-# -------------------------
+# ==========================
+#     Main transfer logic
+# ==========================
 
-def run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank):
+def setup_model_and_layout(local_rank):
+    """
+    Build the same toy model on both nodes and compute a layout over its weights.
+    Returns:
+      model (on GPU), layout dict, total_bytes (for RDMA buffer).
+    """
+    device = torch.device("cuda", local_rank)
+    model = ToyPolicyNet().to(device)
+
+    # You can randomize per-rank to see changes moving across later
+    for p in model.parameters():
+        nn.init.uniform_(p, a=-0.1, b=0.1)
+
+    layout = build_layout_from_state_dict(model.state_dict())
+    total_elems = layout["total_elems"]
+    elem_size = 4  # float32
+    total_bytes = total_elems * elem_size
+
+    if local_rank == 0:
+        print(
+            f"[layout] total_elems={total_elems}, "
+            f"approx_size={total_bytes / (1 << 20):.2f} MB"
+        )
+
+    return model, layout, total_bytes
+
+
+def run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank,
+                 model, layout, total_bytes):
     """
     For each GPU pair (local_rank on node 0, same local_rank on node 1):
 
       - If node_rank == 1: act as RECEIVER
-          * allocate GPU buffer
-          * uccl.reg + get_metadata
-          * advertise + accept
+          * allocate GPU weights buffer (float32) and register its byte view
+          * advertise + accept UCCL endpoint
           * send {addr, md, bytes} to peer via gloo
-          * wait for 1-byte COMMIT from sender
-          * print a few bytes of the received data
+          * per-step: wait for COMMIT, then unpack into local model
 
       - If node_rank == 0: act as SENDER
           * recv {addr, md, bytes} from peer via gloo
-          * uccl.parse_metadata + connect
-          * allocate local GPU buffer, fill pattern
-          * chunked uccl.write into remote buffer
-          * send COMMIT byte via uccl.send
+          * parse_metadata + connect
+          * allocate a flat buffer for weights
+          * per-step: pack model → flat buffer, RDMA write, send COMMIT
     """
     device = torch.device("cuda", local_rank)
+    elem_size = 4  # float32
 
-    # Size of transfer per GPU (adjust as needed)
-    SLAB_MB = 256
-    SLAB_BYTES = SLAB_MB * (1 << 20)
+    # Sanity check: layout should be consistent on both nodes
+    assert total_bytes == layout["total_elems"] * elem_size
 
     if node_rank == 1:
-        # ---------------- RECEIVER NODE ----------------
+        # ================== RECEIVER NODE ==================
         print(f"[R{rank}] acting as RECEIVER; peer_rank={peer_rank}")
 
-        # 1) Allocate destination GPU buffer
-        dst = torch.empty(SLAB_BYTES, dtype=torch.uint8, device=device)
+        # 1) Allocate weights buffer on GPU and register its byte view
+        weights_buf = torch.empty(layout["total_elems"], dtype=torch.float32, device=device)
+        weights_bytes = weights_buf.view(torch.uint8)
+        nbytes = weights_bytes.numel()
 
-        # 2) Register with UCCL and get metadata
-        mr = uccl.reg(int(dst.data_ptr()), int(SLAB_BYTES))
+        mr = uccl.reg(int(weights_bytes.data_ptr()), int(nbytes))
         md = uccl.get_metadata(mr)
 
-        # 3) Advertise address and send metadata to peer via gloo
         addr = uccl.advertise()
 
-        info = {"addr": addr, "bytes": SLAB_BYTES}
+        info = {
+            "addr": addr,
+            "bytes": nbytes,
+        }
         if isinstance(md, (bytes, bytearray)):
             info["md_type"] = "bytes"
             info["md"] = md.hex()
@@ -168,29 +296,39 @@ def run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank):
             info["md_type"] = "str"
             info["md"] = str(md)
 
+        # 2) Send metadata to peer via gloo
         payload = json.dumps(info).encode("utf-8")
         print(f"[R{rank}] sending metadata ({len(payload)} bytes) to R{peer_rank}")
         send_bytes(peer_rank, payload)
 
-        # 4) Accept UCCL connection
+        # 3) Accept UCCL connection
         conn = uccl.accept(addr)
-        print(f"[R{rank}] accepted UCCL conn; waiting for COMMIT byte...")
+        print(f"[R{rank}] accepted UCCL conn; entering steps loop")
 
-        # 5) Wait for 1-byte COMMIT via UCCL (small two-sided message)
-        flag = bytearray(1)
-        n = uccl.recv(conn, flag, 1)
-        print(f"[R{rank}] COMMIT recv returned n={n}, flag={list(flag)}")
-        if n == 1 and flag[0] == COMMIT_BYTE:
-            print(f"[R{rank}] COMMIT received; data now in dst buffer.")
-        else:
-            print(f"[R{rank}] unexpected COMMIT data, n={n}, flag={list(flag)}")
+        # 4) Multi-step loop: each step receives new weights
+        NUM_STEPS = 3
+        for step in range(NUM_STEPS):
+            print(f"[R{rank}] [step {step}] waiting for COMMIT...")
+            flag = bytearray(1)
+            n = uccl.recv(conn, flag, 1)
+            if not (n == 1 and flag[0] == COMMIT_BYTE):
+                print(f"[R{rank}] [step {step}] unexpected COMMIT data n={n}, flag={list(flag)}")
+                break
 
-        # 6) Inspect first few bytes
-        head = dst[:8].cpu().tolist()
-        print(f"[R{rank}] dst[:8] = {head}")
+            # At this point, weights_bytes have been overwritten by sender
+            # Copy them into our model
+            unpack_flat_to_state_dict(weights_buf, model, layout)
+
+            # Just print some diagnostics
+            with torch.no_grad():
+                first_param = next(model.parameters())
+                mean_val = first_param.mean().item()
+            print(f"[R{rank}] [step {step}] updated model; first_param.mean={mean_val:.6f}")
+
+        print(f"[R{rank}] receiver done with steps.")
 
     else:
-        # ---------------- SENDER NODE ----------------
+        # ================== SENDER NODE ==================
         print(f"[R{rank}] acting as SENDER; peer_rank={peer_rank}")
 
         # 1) Receive metadata from peer via gloo
@@ -199,61 +337,88 @@ def run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank):
         info = json.loads(payload.decode("utf-8"))
 
         addr = info["addr"]
-        total_bytes = int(info["bytes"])
+        remote_nbytes = int(info["bytes"])
 
         if info.get("md_type") == "bytes":
             md = bytes.fromhex(info["md"])
         else:
             md = info["md"]
 
-        print(f"[R{rank}] got addr='{addr}', total_bytes={total_bytes/(1<<20):.1f} MB")
+        print(
+            f"[R{rank}] got addr='{addr}', "
+            f"remote_nbytes={remote_nbytes / (1 << 20):.2f} MB"
+        )
+
+        # Remote buffer should match our expected size
+        assert remote_nbytes == total_bytes, (
+            f"remote_nbytes={remote_nbytes} vs local total_bytes={total_bytes}"
+        )
 
         # 2) Parse remote metadata and connect via UCCL
         remote_mr = uccl.parse_metadata(md)
         conn = uccl.connect(addr)
-        print(f"[R{rank}] UCCL connect() succeeded; starting transfer...")
+        print(f"[R{rank}] UCCL connect() succeeded; entering steps loop")
 
-        # 3) Allocate source GPU buffer and fill with a pattern
-        src = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-        src.fill_(0xAB)
+        # 3) Allocate a reusable flat buffer for model weights on this GPU
+        flat_buf = torch.empty(layout["total_elems"], dtype=torch.float32, device=device)
+        flat_bytes = flat_buf.view(torch.uint8)
+        assert flat_bytes.numel() == total_bytes
 
-        base_ptr = int(src.data_ptr())
-        CHUNK = 2 * (1 << 20)  # 2MB chunk size
-        written = 0
+        base_ptr = int(flat_bytes.data_ptr())
+        nbytes = flat_bytes.numel()
+        CHUNK = 2 * (1 << 20)  # 2MB
 
-        t0 = time.time()
-        while written < total_bytes:
-            n = min(CHUNK, total_bytes - written)
-            try_write(conn, base_ptr + written, remote_mr, n, written)
-            written += n
-        torch.cuda.synchronize()
-        t1 = time.time()
+        # 4) Multi-step loop: each step packs and sends new weights
+        NUM_STEPS = 3
+        for step in range(NUM_STEPS):
+            # Simulate model update (e.g., training step)
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.add_(0.01)  # tiny shift so receiver sees change
 
-        gb = total_bytes / 1e9
-        print(
-            f"[R{rank}] sent {total_bytes / (1<<20):.1f} MB "
-            f"in {t1 - t0:.3f} s "
-            f"({gb/(t1 - t0):.2f} GB/s)"
-        )
+            # Pack current model into flat_buf
+            pack_state_dict_inplace(model, layout, flat_buf)
 
-        # 4) Send 1-byte COMMIT via UCCL to let receiver swap / use buffer
-        uccl.send(conn, bytes([COMMIT_BYTE]), 1)
-        print(f"[R{rank}] COMMIT sent.")
+            written = 0
+            t0 = time.time()
+            while written < nbytes:
+                n = min(CHUNK, nbytes - written)
+                try_write(conn, base_ptr + written, remote_mr, n, written)
+                written += n
+            torch.cuda.synchronize()
+            t1 = time.time()
+
+            gb = nbytes / 1e9
+            print(
+                f"[R{rank}] [step {step}] sent {nbytes / (1 << 20):.2f} MB "
+                f"in {t1 - t0:.3f} s "
+                f"({gb / (t1 - t0):.2f} GB/s)"
+            )
+
+            # Send COMMIT byte so receiver knows weights are ready
+            uccl.send(conn, bytes([COMMIT_BYTE]), 1)
+            print(f"[R{rank}] [step {step}] COMMIT sent.")
+
+        print(f"[R{rank}] sender done with steps.")
 
 
-# -------------------------
-# Entrypoint
-# -------------------------
+# ==========================
+#          Main
+# ==========================
 
 def main():
     rank, world_size, local_rank, node_rank, gpus_per_node, peer_rank = init_dist()
 
+    # Build identical model + layout on all ranks
+    model, layout, total_bytes = setup_model_and_layout(local_rank)
+
     dist.barrier()
     if rank == 0:
-        print("[INFO] Starting multi-GPU UCCL transfer round")
+        print("[INFO] Starting multi-GPU UCCL weight transfer demo")
     dist.barrier()
 
-    run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank)
+    run_transfer(rank, local_rank, node_rank, gpus_per_node, peer_rank,
+                 model, layout, total_bytes)
 
     dist.barrier()
     if rank == 0:
