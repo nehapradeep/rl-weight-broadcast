@@ -156,8 +156,7 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
             examples["text"],
             truncation=True,
             padding="max_length",
-            max_length=max_length,
-            return_tensors="pt"
+            max_length=max_length
         )
     
     tokenized_dataset = dataset.map(
@@ -165,6 +164,9 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
         batched=True,
         remove_columns=dataset.column_names
     )
+    
+    # Set format to torch tensors
+    tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
     
     logging.info(f"Tokenization complete")
     logging.info(f"Dataset info:")
