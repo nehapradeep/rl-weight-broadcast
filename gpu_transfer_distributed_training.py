@@ -217,9 +217,10 @@ def evaluate_model(model, val_dataloader, training_group, training_rank):
     perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
     
     # Synchronize validation metrics across training nodes
+    # Use SUM instead of AVG (Gloo doesn't support AVG)
     loss_tensor = torch.tensor([avg_loss], device='cuda')
-    dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG, group=training_group)
-    global_avg_loss = loss_tensor.item()
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM, group=training_group)
+    global_avg_loss = loss_tensor.item() / 2  # Divide by number of training nodes
     global_perplexity = math.exp(global_avg_loss) if global_avg_loss < 100 else float('inf')
     
     logging.info(f"Validation - Local Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}")
@@ -417,9 +418,10 @@ def run_distributed_training(model, tokenizer, rank, world_size, training_group,
         epoch_losses.append(avg_epoch_loss)
         
         # Synchronize training metrics across nodes
+        # Use SUM instead of AVG (Gloo doesn't support AVG)
         loss_tensor = torch.tensor([avg_epoch_loss], device='cuda')
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG, group=training_group)
-        global_avg_loss = loss_tensor.item()
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM, group=training_group)
+        global_avg_loss = loss_tensor.item() / 2  # Divide by number of training nodes
         
         logging.info(f"\n{'='*80}")
         logging.info(f"EPOCH {epoch + 1} TRAINING SUMMARY (Node {training_rank + 1})")
