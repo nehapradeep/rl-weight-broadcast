@@ -3,6 +3,9 @@ import torch, time, os, sys
 import torch.distributed as dist
 
 from transformers import GPT2LMHeadModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL_NAME = "Qwen/Qwen1.5-0.5B"
 from uccl import p2p
 
 def send_model(ep, conn_id, model):
@@ -63,7 +66,10 @@ def main():
         ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
         assert ok, "[Client] connect failed"
 
-        model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
+        #model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).cuda()
+        
         start = time.perf_counter()
         send_model(ep, conn_id, model)
         print(f"[Client] Transfer finished in {time.perf_counter()-start:.2f}s")
