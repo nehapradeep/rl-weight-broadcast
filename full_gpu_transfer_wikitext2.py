@@ -456,12 +456,24 @@ def main():
 
         logging.info("Loading model...")
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
+
+        # Controller side (rank 0) – after model is loaded
         logging.info("Model loaded")
-        
-        broadcast_model(ep, conn_ids, model, rank)
-        
-        logging.info("\nBroadcast complete. Training node (rank 1) and Inference node (rank 2) "
-                    "are now processing...")
+        # 1) Gather metadata from all participant nodes (trainers + rollouts)
+	all_metadata = {rank: local_md}
+	for peer in range(world_size):
+		if peer == rank:
+			continue
+		logging.info(f"Requesting metadata from rank {peer}")
+		# Assuming you send a request or use dist.send/recv
+    		dist.send(torch.ByteTensor(list(local_md)), dst=peer)
+    		remote_md_tensor = torch.zeros(len(local_md), dtype=torch.uint8)
+    		dist.recv(remote_md_tensor, src=peer)
+    		all_metadata[peer] = bytes(remote_md_tensor.tolist())
+	logging.info(f"Received metadata from all peers: {all_metadata.keys()}")
+
+	# 2) Compute routing schedule using your match & routing logic
+	# (You need to implement compute_weight_transfer_schedule, grouping, etc.)
 
     elif rank == 1:
         # Training node
