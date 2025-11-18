@@ -67,17 +67,17 @@ Run on 3 different machines or GPUs:
 ```bash
 # Machine 0 - Broadcaster
 torchrun --nproc_per_node=1 --nnodes=3 --node_rank=0 \
-  --master_addr=192.168.1.100 --master_port=29500 \
+  --master_addr=10.2.96.72 --master_port=29500 \
   gpu_transfer_wikitext2.py
 
 # Machine 1 - Training Node
 torchrun --nproc_per_node=1 --nnodes=3 --node_rank=1 \
-  --master_addr=192.168.1.100 --master_port=29500 \
+  --master_addr=10.2.96.72 --master_port=29500 \
   gpu_transfer_wikitext2.py
 
 # Machine 2 - Inference Node
 torchrun --nproc_per_node=1 --nnodes=3 --node_rank=2 \
-  --master_addr=192.168.1.100 --master_port=29500 \
+  --master_addr=10.2.96.72 --master_port=29500 \
   gpu_transfer_wikitext2.py
 ```
 
