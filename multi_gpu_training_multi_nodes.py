@@ -9,10 +9,12 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from uccl import p2p
-import torch.nn as nn  # <<< MULTI-GPU CHANGE >>>
+import torch.nn as nn
 
 
-# Setup logging
+# ---------------------------
+# Logging
+# ---------------------------
 def setup_logging(rank):
     """Setup logging with timestamps and rank info"""
     log_dir = "logs"
@@ -43,6 +45,9 @@ def setup_logging(rank):
     return log_file
 
 
+# ---------------------------
+# RDMA send/recv helpers
+# ---------------------------
 def broadcast_model(ep, conn_ids, model, rank):
     """Send model to multiple receivers with detailed logging"""
     state_dict = model.state_dict()
@@ -130,6 +135,9 @@ def recv_model(ep, conn_id, model, rank):
     logging.info("="*80)
 
 
+# ---------------------------
+# Dataset preparation
+# ---------------------------
 def prepare_dataset(tokenizer, max_length=128, num_samples=200):
     """Load and prepare WikiText-2 dataset"""
     logging.info("="*80)
@@ -137,20 +145,16 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
     logging.info("="*80)
     logging.info("Loading WikiText-2 dataset from Hugging Face...")
     
-    # Load WikiText-2 (small dataset, good for language modeling)
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     logging.info(f"Dataset loaded: {len(dataset)} total examples")
     
-    # Filter out empty texts
     dataset = dataset.filter(lambda x: len(x["text"].strip()) > 0)
     logging.info(f"After filtering empty texts: {len(dataset)} examples")
     
-    # Take a subset for faster training
     if len(dataset) > num_samples:
         dataset = dataset.select(range(num_samples))
         logging.info(f"Using subset: {num_samples} examples")
     
-    # Tokenize the dataset
     logging.info("Tokenizing dataset...")
     
     def tokenize_function(examples):
@@ -167,11 +171,9 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
         remove_columns=dataset.column_names
     )
     
-    # Set format to torch tensors
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
     
     logging.info(f"Tokenization complete")
-    logging.info(f"Dataset info:")
     logging.info(f"  - Examples: {len(tokenized_dataset)}")
     logging.info(f"  - Max length: {max_length} tokens")
     logging.info("="*80)
@@ -179,18 +181,19 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
     return tokenized_dataset
 
 
+# ---------------------------
+# Training (rank 1)
+# ---------------------------
 def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
-    """Training loop for rank 1 with real dataset (supports DataParallel model)"""
+    """Training loop for rank 1 (supports DataParallel)"""
     logging.info("="*80)
     logging.info("TRAINING NODE - Starting training on WikiText-2")
     logging.info(f"Visible GPUs on this node: {torch.cuda.device_count()}")
     logging.info(f"Model class: {model.__class__.__name__}")
     logging.info("="*80)
     
-    # Prepare dataset
     train_dataset = prepare_dataset(tokenizer, max_length=128, num_samples=200)
     
-    # Create DataLoader
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -199,14 +202,12 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     
     total_steps = len(train_dataloader) * num_epochs
     logging.info(f"Training configuration:")
-    logging.info(f"  - Dataset: WikiText-2")
     logging.info(f"  - Examples: {len(train_dataset)}")
     logging.info(f"  - Batch size: {batch_size}")
     logging.info(f"  - Epochs: {num_epochs}")
     logging.info(f"  - Steps per epoch: {len(train_dataloader)}")
     logging.info(f"  - Total steps: {total_steps}")
     logging.info(f"  - Learning rate: {lr}")
-    logging.info(f"  - Loss function: Cross-Entropy (Causal Language Modeling)")
     logging.info("="*80)
     
     model.train()
@@ -229,48 +230,45 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
             step_start = time.perf_counter()
             global_step += 1
             
-            # Move batch to GPU 0 (DataParallel will scatter to others if present)
+            # Move batch to GPU 0; DataParallel will scatter internally if enabled
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
             
-            # Forward pass (labels = input_ids for causal language modeling)
+            # Forward pass
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=input_ids
             )
-            loss = outputs.loss
-
-            # --- MULTI-GPU SAFE LOSS REDUCTION ---
-            # DataParallel returns per-GPU losses (vector); reduce to scalar
+            loss = outputs.loss  # can be scalar or vector (per-GPU) with DataParallel
+            
+            # ---- MULTI-GPU SAFE LOSS REDUCTION ----
             if isinstance(loss, torch.Tensor) and loss.dim() > 0:
                 loss_scalar = loss.mean()
             else:
                 loss_scalar = loss
             
-            # Backward pass
             optimizer.zero_grad()
             loss_scalar.backward()
             optimizer.step()
             
             step_time = time.perf_counter() - step_start
             
-            # Calculate perplexity from scalar loss
+            # Use scalar loss for metrics
             loss_value = loss_scalar.item()
             perplexity = math.exp(loss_value) if loss_value < 100 else float('inf')
             
-            # Track metrics
             epoch_loss += loss_value
             epoch_perplexity += perplexity
             
-            # Log every 10 steps or last step
             if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_dataloader):
                 logging.info(
-                    f"Step {global_step}/{total_steps} (Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_dataloader)}) | "
-                    f"Loss: {loss_value:.4f} | Perplexity: {perplexity:.2f} | Time: {step_time:.3f}s"
+                    f"Step {global_step}/{total_steps} "
+                    f"(Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_dataloader)}) | "
+                    f"Loss: {loss_value:.4f} | Perplexity: {perplexity:.2f} | "
+                    f"Time: {step_time:.3f}s"
                 )
             
-            # Log gradient norms every 20 steps
             if global_step % 20 == 0:
                 total_norm = 0.0
                 for p in model.parameters():
@@ -280,7 +278,6 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
                 total_norm = total_norm ** 0.5
                 logging.info(f"  -> Gradient norm: {total_norm:.4f}")
         
-        # Epoch summary
         epoch_time = time.perf_counter() - epoch_start
         avg_epoch_loss = epoch_loss / len(train_dataloader)
         avg_epoch_perplexity = epoch_perplexity / len(train_dataloader)
@@ -298,7 +295,6 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     
     logging.info("="*80)
     logging.info("TRAINING COMPLETE")
-    logging.info(f"Dataset: WikiText-2 (200 samples)")
     logging.info(f"Total training time: {total_train_time:.2f}s")
     logging.info(f"Total steps: {total_steps}")
     logging.info(f"Average time per step: {avg_step_time:.3f}s")
@@ -307,13 +303,11 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     logging.info(f"Loss improvement: {epoch_losses[0] - epoch_losses[-1]:.4f}")
     logging.info("="*80)
     
-    # Save checkpoint
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # If using DataParallel, save the underlying module's state_dict
-    save_model = model.module if isinstance(model, nn.DataParallel) else model  # <<< MULTI-GPU CHANGE >>>
-
+    
+    # If DataParallel is used, save underlying module
+    save_model = model.module if isinstance(model, nn.DataParallel) else model
     checkpoint_path = f"{checkpoint_dir}/model_rank1_wikitext2_trained.pt"
     torch.save({
         'model_state_dict': save_model.state_dict(),
@@ -325,15 +319,15 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     logging.info(f"Model checkpoint saved to: {checkpoint_path}")
 
 
+# ---------------------------
+# Inference (rank 2)
+# ---------------------------
 def run_inference(model, tokenizer, num_samples=5):
-    """Inference loop for rank 2"""
     logging.info("="*80)
     logging.info("INFERENCE NODE - Starting inference")
     logging.info("="*80)
     
     model.eval()
-    
-    # Sample prompts for inference
     prompts = [
         "Once upon a time",
         "The future of artificial intelligence",
@@ -346,7 +340,7 @@ def run_inference(model, tokenizer, num_samples=5):
     ]
     
     logging.info(f"Running inference on {num_samples} prompts")
-    logging.info(f"Generation settings: max_length=50, temperature=0.7, top_k=50, top_p=0.95")
+    logging.info("Generation settings: max_length=50, temperature=0.7, top_k=50, top_p=0.95")
     
     total_inference_start = time.perf_counter()
     total_tokens = 0
@@ -360,11 +354,9 @@ def run_inference(model, tokenizer, num_samples=5):
             logging.info(f"{'='*60}")
             logging.info(f"Prompt: '{prompt}'")
             
-            # Tokenize input
             inputs = tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].cuda()
             
-            # Generate text
             generation_start = time.perf_counter()
             output_ids = model.generate(
                 input_ids,
@@ -378,7 +370,6 @@ def run_inference(model, tokenizer, num_samples=5):
             )
             generation_time = time.perf_counter() - generation_start
             
-            # Decode output
             generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             
             inference_time = time.perf_counter() - inference_start
@@ -409,34 +400,34 @@ def run_inference(model, tokenizer, num_samples=5):
     logging.info("="*80)
 
 
+# ---------------------------
+# Main (all ranks)
+# ---------------------------
 def main():
     dist.init_process_group(backend="gloo")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
-    # Setup logging first
     log_file = setup_logging(rank)
     
     logging.info(f"Process started - Rank: {rank}, World size: {world_size}")
     assert world_size == 3, "Run with three ranks (1 broadcaster + 1 training + 1 inference)."
-
-    # --- DEVICE SELECTION CHANGE ---
-    # Use GPU 0 as primary device on each node; trainer will use all GPUs via DataParallel
+    
+    # IMPORTANT: use GPU 0 on each node; trainer uses DataParallel internally
     if torch.cuda.is_available():
-        local_gpu = 0  # <<< MULTI-GPU CHANGE: was `rank`
+        local_gpu = 0
         torch.cuda.set_device(local_gpu)
         logging.info(f"CUDA device set to GPU {local_gpu}")
     else:
         local_gpu = None
-        logging.info("CUDA not available, running on CPU (P2P will not work).")
+        logging.info("CUDA not available. (RDMA will not work.)")
     
-    # Initialize endpoint
     logging.info("Initializing P2P endpoint...")
     ep = p2p.Endpoint(local_gpu, 4)
     local_md = ep.get_metadata()
     logging.info(f"Local metadata obtained (size: {len(local_md)} bytes)")
     
-    # Exchange metadata - all-to-all style
+    # Exchange metadata
     logging.info("Starting metadata exchange...")
     all_metadata = [None] * world_size
     all_metadata[rank] = local_md
@@ -444,21 +435,18 @@ def main():
     metadata_start = time.perf_counter()
     for i in range(world_size):
         if i == rank:
-            # Send my metadata to all others
             for j in range(world_size):
                 if j != rank:
                     dist.send(torch.ByteTensor(list(local_md)), dst=j)
         else:
-            # Receive metadata from rank i
             remote_md = torch.zeros(len(local_md), dtype=torch.uint8)
             dist.recv(remote_md, src=i)
             all_metadata[i] = bytes(remote_md.tolist())
-    
     metadata_time = time.perf_counter() - metadata_start
     logging.info(f"Metadata exchange complete in {metadata_time:.2f}s")
     
     if rank == 0:
-        # Broadcaster: connect to rank 1 and rank 2
+        # Broadcaster
         logging.info("="*80)
         logging.info("BROADCASTER MODE")
         logging.info("="*80)
@@ -476,17 +464,16 @@ def main():
             node_type = "Training Node" if receiver_rank == 1 else "Inference Node"
             logging.info(f"Connected to {node_type} (rank {receiver_rank}, conn_id={conn_id})")
         
-        logging.info("Loading model...")
+        logging.info("Loading model on broadcaster...")
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         logging.info("Model loaded")
         
         broadcast_model(ep, conn_ids, model, rank)
         
-        logging.info("\nBroadcast complete. Training node (rank 1) and Inference node (rank 2) "
-                     "are now processing...")
+        logging.info("\nBroadcast complete. Training node (rank 1) and Inference node (rank 2) are now processing...")
     
     elif rank == 1:
-        # Training node
+        # Trainer
         logging.info("="*80)
         logging.info("TRAINING NODE (Rank 1)")
         logging.info("="*80)
@@ -494,18 +481,16 @@ def main():
         
         ok, r_ip, r_gpu, conn_id = ep.accept()
         assert ok, "Accept failed"
-        logging.info(f"Connected to broadcaster")
+        logging.info("Connected to broadcaster")
         
         logging.info("Loading model and tokenizer...")
-        base_model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()  # base model on GPU 0
+        base_model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = tokenizer.eos_token
         logging.info("Model and tokenizer loaded")
         
-        # Receive weights into base model
         recv_model(ep, conn_id, base_model, rank)
-
-        # Wrap in DataParallel if multiple GPUs are available
+        
         if torch.cuda.device_count() > 1:
             device_ids = list(range(torch.cuda.device_count()))
             logging.info(f"Wrapping model in DataParallel across GPUs: {device_ids}")
@@ -514,11 +499,10 @@ def main():
             logging.info("Only one GPU detected; using single-GPU training.")
             model = base_model
         
-        # Start training with WikiText-2 dataset
         run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5)
     
-    else:  # rank == 2
-        # Inference node
+    else:
+        # Inference node (rank 2)
         logging.info("="*80)
         logging.info("INFERENCE NODE (Rank 2)")
         logging.info("="*80)
@@ -526,7 +510,7 @@ def main():
         
         ok, r_ip, r_gpu, conn_id = ep.accept()
         assert ok, "Accept failed"
-        logging.info(f"Connected to broadcaster")
+        logging.info("Connected to broadcaster")
         
         logging.info("Loading model and tokenizer...")
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
@@ -534,8 +518,6 @@ def main():
         logging.info("Model and tokenizer loaded")
         
         recv_model(ep, conn_id, model, rank)
-        
-        # Start inference
         run_inference(model, tokenizer, num_samples=5)
     
     logging.info("Destroying process group...")
