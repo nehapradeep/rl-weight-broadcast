@@ -240,9 +240,11 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
             )
             loss = outputs.loss
             
-            # Backward pass
+            # FIX: DataParallel returns a vector of losses → reduce to scalar
+            loss_scalar = loss.mean()
+
             optimizer.zero_grad()
-            loss.backward()
+            loss_scalar.backward()
             optimizer.step()
             
             step_time = time.perf_counter() - step_start
