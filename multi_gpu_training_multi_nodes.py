@@ -9,6 +9,7 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from uccl import p2p
+import torch.nn as nn  # <<< MULTI-GPU CHANGE >>>
 
 
 # Setup logging
@@ -182,8 +183,8 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     """Training loop for rank 1 with real dataset (supports DataParallel model)"""
     logging.info("="*80)
     logging.info("TRAINING NODE - Starting training on WikiText-2")
-    logging.info(f"Number of visible GPUs: {torch.cuda.device_count()}")
-    logging.info(f"Model type: {type(model)}")
+    logging.info(f"Visible GPUs on this node: {torch.cuda.device_count()}")
+    logging.info(f"Model class: {model.__class__.__name__}")
     logging.info("="*80)
     
     # Prepare dataset
@@ -239,33 +240,39 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
                 labels=input_ids
             )
             loss = outputs.loss
-            
-            # FIX: DataParallel returns a vector of losses → reduce to scalar
-            loss_scalar = loss.mean()
 
+            # --- MULTI-GPU SAFE LOSS REDUCTION ---
+            # DataParallel returns per-GPU losses (vector); reduce to scalar
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss_scalar = loss.mean()
+            else:
+                loss_scalar = loss
+            
+            # Backward pass
             optimizer.zero_grad()
             loss_scalar.backward()
             optimizer.step()
             
             step_time = time.perf_counter() - step_start
             
-            # Calculate perplexity
-            perplexity = math.exp(loss.item()) if loss.item() < 100 else float('inf')
+            # Calculate perplexity from scalar loss
+            loss_value = loss_scalar.item()
+            perplexity = math.exp(loss_value) if loss_value < 100 else float('inf')
             
             # Track metrics
-            epoch_loss += loss.item()
+            epoch_loss += loss_value
             epoch_perplexity += perplexity
             
             # Log every 10 steps or last step
             if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_dataloader):
                 logging.info(
                     f"Step {global_step}/{total_steps} (Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_dataloader)}) | "
-                    f"Loss: {loss.item():.4f} | Perplexity: {perplexity:.2f} | Time: {step_time:.3f}s"
+                    f"Loss: {loss_value:.4f} | Perplexity: {perplexity:.2f} | Time: {step_time:.3f}s"
                 )
             
             # Log gradient norms every 20 steps
             if global_step % 20 == 0:
-                total_norm = 0
+                total_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
@@ -304,8 +311,8 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # If using DataParallel, save the underlying module's state dict
-    save_model = model.module if isinstance(model, torch.nn.DataParallel) else model  # <<<
+    # If using DataParallel, save the underlying module's state_dict
+    save_model = model.module if isinstance(model, nn.DataParallel) else model  # <<< MULTI-GPU CHANGE >>>
 
     checkpoint_path = f"{checkpoint_dir}/model_rank1_wikitext2_trained.pt"
     torch.save({
@@ -413,17 +420,16 @@ def main():
     logging.info(f"Process started - Rank: {rank}, World size: {world_size}")
     assert world_size == 3, "Run with three ranks (1 broadcaster + 1 training + 1 inference)."
 
-    # --- DEVICE SELECTION (UPDATED) ---
-    # Use GPU 0 as the primary device on each node. Trainer will use DataParallel
-    # to use all GPUs on its node.
+    # --- DEVICE SELECTION CHANGE ---
+    # Use GPU 0 as primary device on each node; trainer will use all GPUs via DataParallel
     if torch.cuda.is_available():
-        local_gpu = 0  # <<< always use GPU 0 as primary on each node
+        local_gpu = 0  # <<< MULTI-GPU CHANGE: was `rank`
         torch.cuda.set_device(local_gpu)
         logging.info(f"CUDA device set to GPU {local_gpu}")
     else:
         local_gpu = None
-        logging.info("CUDA not available, running on CPU (this will break UCCl P2P)")
-
+        logging.info("CUDA not available, running on CPU (P2P will not work).")
+    
     # Initialize endpoint
     logging.info("Initializing P2P endpoint...")
     ep = p2p.Endpoint(local_gpu, 4)
@@ -491,21 +497,21 @@ def main():
         logging.info(f"Connected to broadcaster")
         
         logging.info("Loading model and tokenizer...")
-        base_model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()  # base single-GPU model  # <<<
+        base_model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()  # base model on GPU 0
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = tokenizer.eos_token
         logging.info("Model and tokenizer loaded")
         
-        # Receive weights into the base model (on GPU 0)
-        recv_model(ep, conn_id, base_model, rank)  # <<<
-        
-        # Wrap in DataParallel if we have multiple GPUs on this node
-        if torch.cuda.device_count() > 1:  # <<<
+        # Receive weights into base model
+        recv_model(ep, conn_id, base_model, rank)
+
+        # Wrap in DataParallel if multiple GPUs are available
+        if torch.cuda.device_count() > 1:
             device_ids = list(range(torch.cuda.device_count()))
-            logging.info(f"Wrapping model in DataParallel on GPUs: {device_ids}")
-            model = torch.nn.DataParallel(base_model, device_ids=device_ids)
+            logging.info(f"Wrapping model in DataParallel across GPUs: {device_ids}")
+            model = nn.DataParallel(base_model, device_ids=device_ids)
         else:
-            logging.info("Only one GPU detected on this node; using single-GPU training.")
+            logging.info("Only one GPU detected; using single-GPU training.")
             model = base_model
         
         # Start training with WikiText-2 dataset
