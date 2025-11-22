@@ -4,6 +4,8 @@ import torch.distributed as dist
 import logging
 from datetime import datetime
 import math
+from dataclasses import dataclass
+from typing import Dict, Tuple, Any
 
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
@@ -392,6 +394,21 @@ def run_inference(model, tokenizer, num_samples=5):
     logging.info(f"Average tokens/sec: {avg_tokens_per_sec:.1f}")
     logging.info("="*80)
 
+def compute_weight_transfer_schedule(
+    trainers: list[ParametersMetadata],
+    rollouts: list[ParametersMetadata],
+    trainer_named_parameters: dict[str, ParameterMetadata],
+    name_mappings: list[WeightNameMapping],
+) -> WeightTransferSchedule:
+    mesh_set: set[Mesh] = ...
+    mesh_groups = find_disjoint_mesh_groups(mesh_set)
+    trainer_tables = [WeightTransferRoutingTable([]) for _ in trainers]
+    for mesh_group in mesh_groups:
+        trainer_groups = generate_table_for_mesh_group(trainers, rollouts, name_mappings_with_mesh, mesh_group)
+        for table, group in zip(trainer_tables, trainer_groups):
+            table.groups.append(group)
+    return WeightTransferSchedule(trainer_tables)
+
 
 def main():
     dist.init_process_group(backend="gloo")
@@ -460,20 +477,26 @@ def main():
         # Controller side (rank 0) – after model is loaded
         logging.info("Model loaded")
         # 1) Gather metadata from all participant nodes (trainers + rollouts)
-	all_metadata = {rank: local_md}
-	for peer in range(world_size):
-		if peer == rank:
-			continue
-		logging.info(f"Requesting metadata from rank {peer}")
-		# Assuming you send a request or use dist.send/recv
-    		dist.send(torch.ByteTensor(list(local_md)), dst=peer)
-    		remote_md_tensor = torch.zeros(len(local_md), dtype=torch.uint8)
-    		dist.recv(remote_md_tensor, src=peer)
-    		all_metadata[peer] = bytes(remote_md_tensor.tolist())
-	logging.info(f"Received metadata from all peers: {all_metadata.keys()}")
+        all_metadata = {rank: local_md}
+        for peer in range(world_size):
+            if peer == rank:
+                continue
+            logging.info(f"Requesting metadata from rank {peer}")
+            # Assuming you send a request or use dist.send/recv
+            dist.send(torch.ByteTensor(list(local_md)), dst=peer)
+            remote_md_tensor = torch.zeros(len(local_md), dtype=torch.uint8)
+            dist.recv(remote_md_tensor, src=peer)
+            all_metadata[peer] = bytes(remote_md_tensor.tolist())
+        logging.info(f"Received metadata from all peers: {all_metadata.keys()}")
 
-	# 2) Compute routing schedule using your match & routing logic
-	# (You need to implement compute_weight_transfer_schedule, grouping, etc.)
+        # 2) Compute routing schedule using your match & routing logic
+        # (You need to implement compute_weight_transfer_schedule, grouping, etc.)
+        schedule = compute_weight_transfer_schedule(
+            trainer_named_parameters = trainer_params,   # e.g., metadata from trainers
+            rollout_named_parameters = rollout_params,   # e.g., metadata from rollouts
+            name_mappings = name_mappings                 # how trainer names map to rollout names
+        )
+        logging.info("Routing schedule computed")
 
     elif rank == 1:
         # Training node
