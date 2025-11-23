@@ -307,7 +307,6 @@ def run_trainer_rank(
     trainer_ranks,
     device: torch.device,
     ep: p2p.Endpoint,
-    all_metadata,
     root_trainer: int,
 ):
     """Logic for all trainer ranks (DDP)."""
@@ -402,19 +401,28 @@ def main():
     logging.info(f"UCCl local metadata size: {len(local_md)} bytes")
 
     # ------------------------------------------------------------------
-    # FIXED: Metadata exchange using all_gather on CUDA tensors (no hangs)
+    # MINIMAL METADATA EXCHANGE:
+    # only between root trainer (rank 1) and broadcaster (rank 0)
     # ------------------------------------------------------------------
-    logging.info("Starting metadata exchange among all ranks...")
-    md_tensor = torch.tensor(list(local_md), dtype=torch.uint8, device=device)
+    root_md_bytes = None
 
-    gather_list = [torch.zeros_like(md_tensor) for _ in range(world_size)]
-
-    t0 = time.perf_counter()
-    dist.all_gather(gather_list, md_tensor)
-    t_meta = time.perf_counter() - t0
-
-    all_metadata = [bytes(t.cpu().tolist()) for t in gather_list]
-    logging.info(f"Metadata exchange complete in {t_meta:.2f}s")
+    if rank == root_trainer:
+        # Root trainer sends its UCCl metadata to broadcaster
+        logging.info("Root trainer sending UCCl metadata to broadcaster via NCCL...")
+        md_tensor = torch.tensor(list(local_md), dtype=torch.uint8, device=device)
+        dist.send(md_tensor, dst=broadcaster_rank)
+        logging.info("Root trainer sent UCCl metadata.")
+    elif rank == broadcaster_rank:
+        # Broadcaster receives root trainer's UCCl metadata
+        logging.info("Broadcaster waiting for UCCl metadata from root trainer...")
+        # Assume same metadata length (UCCl format is uniform across ranks)
+        recv_tensor = torch.zeros(len(local_md), dtype=torch.uint8, device=device)
+        dist.recv(recv_tensor, src=root_trainer)
+        root_md_bytes = bytes(recv_tensor.cpu().tolist())
+        logging.info("Broadcaster received UCCl metadata from root trainer.")
+    else:
+        # Other trainers don't care about UCCl metadata
+        pass
 
     # Roles
     if rank == broadcaster_rank:
@@ -423,15 +431,14 @@ def main():
         logging.info("BROADCASTER MODE")
         logging.info("=" * 80)
 
-        target_rank = root_trainer
-        ip, port, r_gpu = p2p.Endpoint.parse_metadata(all_metadata[target_rank])
+        ip, port, r_gpu = p2p.Endpoint.parse_metadata(root_md_bytes)
         logging.info(
-            f"Connecting to root trainer rank {target_rank} via UCCl: "
+            f"Connecting to root trainer rank {root_trainer} via UCCl: "
             f"ip={ip}, port={port}, remote_gpu={r_gpu}"
         )
 
         ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
-        assert ok, f"UCCl connect failed to rank {target_rank}"
+        assert ok, f"UCCl connect failed to rank {root_trainer}"
         logging.info(f"Connected to root trainer (conn_id={conn_id})")
 
         logging.info("Loading model on broadcaster...")
@@ -443,7 +450,7 @@ def main():
 
     elif rank in trainer_ranks:
         # All trainer ranks participate in DDP training
-        run_trainer_rank(rank, trainer_ranks, device, ep, all_metadata, root_trainer)
+        run_trainer_rank(rank, trainer_ranks, device, ep, root_trainer)
 
     else:
         logging.error(f"Unexpected rank {rank} (should be 0 or in {trainer_ranks})")
