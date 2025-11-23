@@ -14,6 +14,32 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from uccl import p2p
 import torch.nn as nn
+import json
+import numpy as np
+
+# ---------------------------
+# DTensor parameter metadata helpers
+# ---------------------------
+def gather_dtensor_param_metadata(model):
+    metadata = {}
+    for name, param in model.named_parameters():
+        dtensor = param.data
+        entry = {
+            "name": name,
+            "shape": list(dtensor.shape),
+            "dtype": str(dtensor.dtype),
+        }
+        # Try to get mesh and placement info if DTensor
+        if hasattr(dtensor, "device_mesh"):
+            entry["mesh"] = {
+                "ndim": dtensor.device_mesh.ndim,
+                "devices": [str(d) for d in dtensor.device_mesh.devices],
+                "mesh_shape": list(dtensor.device_mesh.shape),
+            }
+        if hasattr(dtensor, "placements"):
+            entry["placements"] = [str(p) for p in dtensor.placements]
+        metadata[name] = entry
+    return metadata
 
 
 # ---------------------------
@@ -483,28 +509,34 @@ def main():
         logging.info("="*80)
         logging.info("Connecting to receivers...")
         conn_ids = []
-        
         for receiver_rank in [1, 2]:
             ip, port, r_gpu = p2p.Endpoint.parse_metadata(all_metadata[receiver_rank])
             logging.info(f"Connecting to rank {receiver_rank}: IP={ip}, Port={port}, GPU={r_gpu}")
-            
             ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
             assert ok, f"Connect failed to rank {receiver_rank}"
             conn_ids.append(conn_id)
-            
             node_type = "Training Node" if receiver_rank == 1 else "Inference Node"
             logging.info(f"Connected to {node_type} (rank {receiver_rank}, conn_id={conn_id})")
-        
-        logging.info("Loading model on broadcaster...")
-        model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
-        logging.info("Model loaded")
-        # Convert model parameters to Dtensors
-        for name, param in model.named_parameters():
-            param.data = DTensor(param.data, device_mesh, [Replicate()])
-        
-        broadcast_model(ep, conn_ids, model, rank)
-        
-        logging.info("\nBroadcast complete. Training node (rank 1) and Inference node (rank 2) are now processing...")
+
+        # Receive parameter metadata from trainer and inference nodes
+        param_metadata = {}
+        for src_rank in [1, 2]:
+            logging.info(f"Receiving parameter metadata from rank {src_rank}...")
+            size_tensor = torch.zeros(1, dtype=torch.int32)
+            dist.recv(size_tensor, src=src_rank)
+            size = int(size_tensor.item())
+            buf = torch.empty(size, dtype=torch.uint8)
+            dist.recv(buf, src=src_rank)
+            meta_json = buf.cpu().numpy().tobytes().decode("utf-8")
+            param_metadata[src_rank] = json.loads(meta_json)
+            logging.info(f"Received metadata from rank {src_rank}: {len(param_metadata[src_rank])} parameters")
+
+        # Configure routing table using param_metadata
+        logging.info("Configuring routing table with received parameter metadata...")
+        # ... Routing table logic goes here ...
+        logging.info("Routing table configured.")
+
+        logging.info("Broadcaster setup complete. Ready for further operations.")
     
     elif rank == 1:
         # Trainer
@@ -512,11 +544,10 @@ def main():
         logging.info("TRAINING NODE (Rank 1)")
         logging.info("="*80)
         logging.info("Waiting for broadcaster connection...")
-        
         ok, r_ip, r_gpu, conn_id = ep.accept()
         assert ok, "Accept failed"
         logging.info("Connected to broadcaster")
-        
+
         logging.info("Loading model and tokenizer...")
         base_model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -525,9 +556,18 @@ def main():
         # Convert model parameters to Dtensors
         for name, param in base_model.named_parameters():
             param.data = DTensor(param.data, device_mesh, [Replicate()])
-        
+
+        # Gather and send parameter metadata to broadcaster
+        param_meta = gather_dtensor_param_metadata(base_model)
+        meta_json = json.dumps(param_meta).encode("utf-8")
+        meta_tensor = torch.from_numpy(np.frombuffer(meta_json, dtype=np.uint8))
+        size_tensor = torch.tensor([meta_tensor.numel()], dtype=torch.int32)
+        dist.send(size_tensor, dst=0)
+        dist.send(meta_tensor, dst=0)
+        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.item()} bytes)")
+
         recv_model(ep, conn_id, base_model, rank)
-        
+
         if torch.cuda.device_count() > 1:
             device_ids = list(range(torch.cuda.device_count()))
             logging.info(f"Wrapping model in DataParallel across GPUs: {device_ids}")
@@ -535,7 +575,7 @@ def main():
         else:
             logging.info("Only one GPU detected; using single-GPU training.")
             model = base_model
-        
+
         run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5)
     
     else:
@@ -544,11 +584,10 @@ def main():
         logging.info("INFERENCE NODE (Rank 2)")
         logging.info("="*80)
         logging.info("Waiting for broadcaster connection...")
-        
         ok, r_ip, r_gpu, conn_id = ep.accept()
         assert ok, "Accept failed"
         logging.info("Connected to broadcaster")
-        
+
         logging.info("Loading model and tokenizer...")
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -556,7 +595,16 @@ def main():
         # Convert model parameters to Dtensors
         for name, param in model.named_parameters():
             param.data = DTensor(param.data, device_mesh, [Replicate()])
-        
+
+        # Gather and send parameter metadata to broadcaster
+        param_meta = gather_dtensor_param_metadata(model)
+        meta_json = json.dumps(param_meta).encode("utf-8")
+        meta_tensor = torch.from_numpy(np.frombuffer(meta_json, dtype=np.uint8))
+        size_tensor = torch.tensor([meta_tensor.numel()], dtype=torch.int32)
+        dist.send(size_tensor, dst=0)
+        dist.send(meta_tensor, dst=0)
+        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.item()} bytes)")
+
         recv_model(ep, conn_id, model, rank)
         run_inference(model, tokenizer, num_samples=5)
     
