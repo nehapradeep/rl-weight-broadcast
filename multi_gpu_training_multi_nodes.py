@@ -1,9 +1,13 @@
 from __future__ import annotations
 import torch, time, os, sys
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor, Replicate, Shard
 import logging
 from datetime import datetime
 import math
+
+# DTensor setup
+from torch.distributed.device_mesh import DeviceMesh
 
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
@@ -51,6 +55,10 @@ def setup_logging(rank):
 def broadcast_model(ep, conn_ids, model, rank):
     """Send model to multiple receivers with detailed logging"""
     state_dict = model.state_dict()
+    # Convert all tensors in state_dict to local torch.Tensor for RDMA
+    for name, tensor in state_dict.items():
+        if hasattr(tensor, "to_local"):
+            state_dict[name] = tensor.to_local()
     total_tensors = len(list(state_dict.items()))
     total_size_mb = sum(t.numel() * t.element_size() for t in state_dict.values()) / 1e6
     
@@ -95,6 +103,10 @@ def broadcast_model(ep, conn_ids, model, rank):
 def recv_model(ep, conn_id, model, rank):
     """Receive model from broadcaster with detailed logging"""
     state_dict = model.state_dict()
+    # Convert all tensors in state_dict to local torch.Tensor for RDMA
+    for name, tensor in state_dict.items():
+        if hasattr(tensor, "to_local"):
+            state_dict[name] = tensor.to_local()
     total_tensors = len(list(state_dict.items()))
     total_size_mb = sum(t.numel() * t.element_size() for t in state_dict.values()) / 1e6
     
@@ -233,6 +245,14 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
             # Move batch to GPU 0; DataParallel will scatter internally if enabled
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
+            # Convert batch tensors to Dtensors
+            if torch.cuda.device_count() > 1:
+                mesh_devices = list(range(torch.cuda.device_count()))
+                device_mesh = DeviceMesh("cuda", mesh_devices)
+            else:
+                device_mesh = DeviceMesh("cuda", [0])
+            input_ids = DTensor(input_ids, device_mesh, [Replicate()])
+            attention_mask = DTensor(attention_mask, device_mesh, [Replicate()])
             
             # Forward pass
             outputs = model(
@@ -356,6 +376,13 @@ def run_inference(model, tokenizer, num_samples=5):
             
             inputs = tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].cuda()
+            # Convert input_ids to Dtensor
+            if torch.cuda.device_count() > 1:
+                mesh_devices = list(range(torch.cuda.device_count()))
+                device_mesh = DeviceMesh("cuda", mesh_devices)
+            else:
+                device_mesh = DeviceMesh("cuda", [0])
+            input_ids = DTensor(input_ids, device_mesh, [Replicate()])
             
             generation_start = time.perf_counter()
             output_ids = model.generate(
@@ -413,13 +440,17 @@ def main():
     logging.info(f"Process started - Rank: {rank}, World size: {world_size}")
     assert world_size == 3, "Run with three ranks (1 broadcaster + 1 training + 1 inference)."
     
+
     # IMPORTANT: use GPU 0 on each node; trainer uses DataParallel internally
     if torch.cuda.is_available():
         local_gpu = 0
         torch.cuda.set_device(local_gpu)
         logging.info(f"CUDA device set to GPU {local_gpu}")
+        mesh_devices = list(range(torch.cuda.device_count()))
+        device_mesh = DeviceMesh("cuda", mesh_devices)
     else:
         local_gpu = None
+        device_mesh = None
         logging.info("CUDA not available. (RDMA will not work.)")
     
     logging.info("Initializing P2P endpoint...")
@@ -467,6 +498,9 @@ def main():
         logging.info("Loading model on broadcaster...")
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         logging.info("Model loaded")
+        # Convert model parameters to Dtensors
+        for name, param in model.named_parameters():
+            param.data = DTensor(param.data, device_mesh, [Replicate()])
         
         broadcast_model(ep, conn_ids, model, rank)
         
@@ -488,6 +522,9 @@ def main():
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = tokenizer.eos_token
         logging.info("Model and tokenizer loaded")
+        # Convert model parameters to Dtensors
+        for name, param in base_model.named_parameters():
+            param.data = DTensor(param.data, device_mesh, [Replicate()])
         
         recv_model(ep, conn_id, base_model, rank)
         
@@ -516,6 +553,9 @@ def main():
         model = GPT2LMHeadModel.from_pretrained("gpt2").cuda()
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         logging.info("Model and tokenizer loaded")
+        # Convert model parameters to Dtensors
+        for name, param in model.named_parameters():
+            param.data = DTensor(param.data, device_mesh, [Replicate()])
         
         recv_model(ep, conn_id, model, rank)
         run_inference(model, tokenizer, num_samples=5)
