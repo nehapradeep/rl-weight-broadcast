@@ -401,7 +401,9 @@ def main():
     local_md = ep.get_metadata()
     logging.info(f"UCCl local metadata size: {len(local_md)} bytes")
 
-    # Exchange metadata among all ranks (for UCCl)
+    # ------------------------------------------------------------------
+    # FIX: Metadata exchange with NCCL must use CUDA tensors, not CPU
+    # ------------------------------------------------------------------
     logging.info("Starting metadata exchange among all ranks...")
     all_metadata = [None] * world_size
     all_metadata[rank] = local_md
@@ -409,13 +411,20 @@ def main():
     t0 = time.perf_counter()
     for i in range(world_size):
         if i == rank:
+            # send my metadata as CUDA tensor
+            send_md = torch.tensor(
+                list(local_md), dtype=torch.uint8, device=device
+            )
             for j in range(world_size):
                 if j != rank:
-                    dist.send(torch.ByteTensor(list(local_md)), dst=j)
+                    dist.send(send_md, dst=j)
         else:
-            remote_md = torch.zeros(len(local_md), dtype=torch.uint8)
-            dist.recv(remote_md, src=i)
-            all_metadata[i] = bytes(remote_md.tolist())
+            # recv metadata into CUDA tensor, then convert to bytes on CPU
+            recv_md = torch.zeros(
+                len(local_md), dtype=torch.uint8, device=device
+            )
+            dist.recv(recv_md, src=i)
+            all_metadata[i] = bytes(recv_md.cpu().tolist())
     t_meta = time.perf_counter() - t0
     logging.info(f"Metadata exchange complete in {t_meta:.2f}s")
 
