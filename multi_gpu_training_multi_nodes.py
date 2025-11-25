@@ -20,6 +20,170 @@ import numpy as np
 # ---------------------------
 # DTensor parameter metadata helpers
 # ---------------------------
+def analyze_dtensor_layout(dtensor, param_name="unknown"):
+    """
+    Analyze DTensor layout to determine which GPU(s) hold which parts of the tensor.
+    Returns a dictionary with layout analysis information.
+    """
+    analysis = {
+        "param_name": param_name,
+        "is_dtensor": isinstance(dtensor, DTensor),
+        "global_shape": list(dtensor.shape) if hasattr(dtensor, "shape") else None,
+        "dtype": str(dtensor.dtype) if hasattr(dtensor, "dtype") else None,
+    }
+    
+    if not isinstance(dtensor, DTensor):
+        # Regular tensor - check device
+        if hasattr(dtensor, "device"):
+            analysis["device"] = str(dtensor.device)
+            analysis["layout_type"] = "regular_tensor"
+        return analysis
+    
+    # DTensor-specific analysis
+    analysis["layout_type"] = "dtensor"
+    
+    # 1. Device mesh information
+    if hasattr(dtensor, "device_mesh") and dtensor.device_mesh is not None:
+        mesh = dtensor.device_mesh
+        analysis["mesh"] = {
+            "ndim": mesh.ndim,
+            "devices": [str(d) for d in mesh.devices],
+            "mesh_shape": list(mesh.shape),
+            "device_type": str(mesh.device_type) if hasattr(mesh, "device_type") else None,
+            "mesh_id": id(mesh),  # Python object ID (process-local)
+        }
+        
+        # Try to get mesh coordinate for current rank
+        if hasattr(mesh, "get_coordinate"):
+            try:
+                coord = mesh.get_coordinate()
+                analysis["mesh"]["current_coordinate"] = list(coord) if coord is not None else None
+            except:
+                pass
+    
+    # 2. Placement information
+    if hasattr(dtensor, "placements") and dtensor.placements is not None:
+        placements = dtensor.placements
+        analysis["placements"] = [str(p) for p in placements]
+        
+        # Analyze placement types
+        placement_types = []
+        shard_info = []
+        
+        for i, placement in enumerate(placements):
+            placement_str = str(placement)
+            placement_types.append(placement_str)
+            
+            # Check if it's a Shard placement
+            if isinstance(placement, Shard):
+                shard_dim = placement.dim if hasattr(placement, "dim") else None
+                shard_info.append({
+                    "mesh_dim": i,
+                    "shard_dim": shard_dim,
+                    "placement_type": "Shard",
+                })
+            elif isinstance(placement, Replicate):
+                shard_info.append({
+                    "mesh_dim": i,
+                    "placement_type": "Replicate",
+                })
+        
+        analysis["placement_types"] = placement_types
+        analysis["shard_info"] = shard_info
+        
+        # Determine overall layout strategy
+        if all(isinstance(p, Replicate) for p in placements):
+            analysis["layout_strategy"] = "replicated"
+        elif any(isinstance(p, Shard) for p in placements):
+            analysis["layout_strategy"] = "sharded"
+        else:
+            analysis["layout_strategy"] = "mixed"
+    
+    # 3. Local tensor information (what this GPU actually holds)
+    if hasattr(dtensor, "to_local"):
+        try:
+            local_tensor = dtensor.to_local()
+            analysis["local_tensor"] = {
+                "shape": list(local_tensor.shape),
+                "dtype": str(local_tensor.dtype),
+                "device": str(local_tensor.device),
+                "numel": local_tensor.numel(),
+                "size_bytes": local_tensor.numel() * local_tensor.element_size(),
+            }
+        except Exception as e:
+            analysis["local_tensor_error"] = str(e)
+    
+    # 4. Try to determine which GPU holds which shard
+    # For sharded tensors, we need to figure out shard assignment
+    if analysis.get("layout_strategy") == "sharded" and "mesh" in analysis:
+        mesh = dtensor.device_mesh
+        devices = mesh.devices
+        mesh_shape = mesh.shape
+        
+        # Calculate shard assignment per GPU
+        gpu_assignments = []
+        
+        # For 1D mesh with Shard placement, each GPU gets a contiguous slice
+        if len(mesh_shape) == 1 and len(placements) == 1:
+            placement = placements[0]
+            if isinstance(placement, Shard):
+                shard_dim = placement.dim
+                global_shape = dtensor.shape
+                
+                if shard_dim < len(global_shape):
+                    dim_size = global_shape[shard_dim]
+                    num_shards = mesh_shape[0]
+                    shard_size = dim_size // num_shards
+                    remainder = dim_size % num_shards
+                    
+                    for gpu_idx in range(num_shards):
+                        shard_start = gpu_idx * shard_size + min(gpu_idx, remainder)
+                        shard_end = shard_start + shard_size + (1 if gpu_idx < remainder else 0)
+                        
+                        gpu_assignments.append({
+                            "gpu_index": gpu_idx,
+                            "device": str(devices[gpu_idx]),
+                            "shard_dim": shard_dim,
+                            "shard_slice": (shard_start, shard_end),
+                            "shard_size": shard_end - shard_start,
+                        })
+        
+        analysis["gpu_assignments"] = gpu_assignments
+    
+    # 5. Try to get global tensor size
+    try:
+        global_numel = dtensor.numel()
+        element_size = dtensor.element_size() if hasattr(dtensor, "element_size") else None
+        analysis["global_size"] = {
+            "numel": global_numel,
+            "size_bytes": global_numel * element_size if element_size else None,
+            "element_size": element_size,
+        }
+    except:
+        pass
+    
+    # 6. Additional DTensor attributes to explore
+    dtensor_attrs = {}
+    for attr in ["_spec", "_local_tensor", "_global_shape", "_stride"]:
+        if hasattr(dtensor, attr):
+            try:
+                val = getattr(dtensor, attr)
+                dtensor_attrs[attr] = str(type(val).__name__)
+                # Try to get more info for _spec
+                if attr == "_spec" and val is not None:
+                    if hasattr(val, "dim_map"):
+                        dtensor_attrs["_spec_dim_map"] = str(val.dim_map) if hasattr(val, "dim_map") else None
+                    if hasattr(val, "placements"):
+                        dtensor_attrs["_spec_placements"] = [str(p) for p in val.placements] if hasattr(val, "placements") else None
+            except:
+                dtensor_attrs[attr] = "accessible_but_error"
+    
+    if dtensor_attrs:
+        analysis["dtensor_internal_attrs"] = dtensor_attrs
+    
+    return analysis
+
+
 def gather_dtensor_param_metadata(model):
     metadata = {}
     for name, param in model.named_parameters():
@@ -557,6 +721,44 @@ def main():
         for name, param in base_model.named_parameters():
             param.data = DTensor(param.data, device_mesh, [Replicate()])
 
+        # STEP 1: Analyze DTensor layout for sample parameters
+        logging.info("="*80)
+        logging.info("DTENSOR LAYOUT ANALYSIS (Training Node)")
+        logging.info("="*80)
+        sample_params = list(base_model.named_parameters())[:5]  # Analyze first 5 params
+        for name, param in sample_params:
+            analysis = analyze_dtensor_layout(param.data, param_name=name)
+            logging.info(f"\nParameter: {name}")
+            logging.info(f"  Is DTensor: {analysis.get('is_dtensor')}")
+            logging.info(f"  Layout type: {analysis.get('layout_type')}")
+            logging.info(f"  Layout strategy: {analysis.get('layout_strategy', 'N/A')}")
+            if 'mesh' in analysis:
+                mesh_info = analysis['mesh']
+                logging.info(f"  Mesh devices: {mesh_info.get('devices')}")
+                logging.info(f"  Mesh shape: {mesh_info.get('mesh_shape')}")
+                logging.info(f"  Mesh ID (process-local): {mesh_info.get('mesh_id')}")
+            if 'placements' in analysis:
+                logging.info(f"  Placements: {analysis['placements']}")
+            if 'shard_info' in analysis:
+                logging.info(f"  Shard info: {analysis['shard_info']}")
+            if 'local_tensor' in analysis:
+                local = analysis['local_tensor']
+                logging.info(f"  Local tensor shape: {local.get('shape')}")
+                logging.info(f"  Local tensor device: {local.get('device')}")
+                logging.info(f"  Local tensor size: {local.get('size_bytes', 0) / 1e6:.2f} MB")
+            if 'gpu_assignments' in analysis and analysis['gpu_assignments']:
+                logging.info(f"  GPU assignments: {len(analysis['gpu_assignments'])} GPUs")
+                for gpu_assignment in analysis['gpu_assignments'][:3]:  # Show first 3
+                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}): "
+                               f"shard_slice={gpu_assignment.get('shard_slice')}, "
+                               f"size={gpu_assignment.get('shard_size')}")
+            if 'global_size' in analysis:
+                global_size = analysis['global_size']
+                logging.info(f"  Global size: {global_size.get('size_bytes', 0) / 1e6:.2f} MB")
+            if 'dtensor_internal_attrs' in analysis:
+                logging.info(f"  Internal attrs: {list(analysis['dtensor_internal_attrs'].keys())}")
+        logging.info("="*80)
+
         # Gather and send parameter metadata to broadcaster
         param_meta = gather_dtensor_param_metadata(base_model)
         meta_json = json.dumps(param_meta).encode("utf-8")
@@ -595,6 +797,44 @@ def main():
         # Convert model parameters to Dtensors
         for name, param in model.named_parameters():
             param.data = DTensor(param.data, device_mesh, [Replicate()])
+
+        # STEP 1: Analyze DTensor layout for sample parameters
+        logging.info("="*80)
+        logging.info("DTENSOR LAYOUT ANALYSIS (Inference Node)")
+        logging.info("="*80)
+        sample_params = list(model.named_parameters())[:5]  # Analyze first 5 params
+        for name, param in sample_params:
+            analysis = analyze_dtensor_layout(param.data, param_name=name)
+            logging.info(f"\nParameter: {name}")
+            logging.info(f"  Is DTensor: {analysis.get('is_dtensor')}")
+            logging.info(f"  Layout type: {analysis.get('layout_type')}")
+            logging.info(f"  Layout strategy: {analysis.get('layout_strategy', 'N/A')}")
+            if 'mesh' in analysis:
+                mesh_info = analysis['mesh']
+                logging.info(f"  Mesh devices: {mesh_info.get('devices')}")
+                logging.info(f"  Mesh shape: {mesh_info.get('mesh_shape')}")
+                logging.info(f"  Mesh ID (process-local): {mesh_info.get('mesh_id')}")
+            if 'placements' in analysis:
+                logging.info(f"  Placements: {analysis['placements']}")
+            if 'shard_info' in analysis:
+                logging.info(f"  Shard info: {analysis['shard_info']}")
+            if 'local_tensor' in analysis:
+                local = analysis['local_tensor']
+                logging.info(f"  Local tensor shape: {local.get('shape')}")
+                logging.info(f"  Local tensor device: {local.get('device')}")
+                logging.info(f"  Local tensor size: {local.get('size_bytes', 0) / 1e6:.2f} MB")
+            if 'gpu_assignments' in analysis and analysis['gpu_assignments']:
+                logging.info(f"  GPU assignments: {len(analysis['gpu_assignments'])} GPUs")
+                for gpu_assignment in analysis['gpu_assignments'][:3]:  # Show first 3
+                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}): "
+                               f"shard_slice={gpu_assignment.get('shard_slice')}, "
+                               f"size={gpu_assignment.get('shard_size')}")
+            if 'global_size' in analysis:
+                global_size = analysis['global_size']
+                logging.info(f"  Global size: {global_size.get('size_bytes', 0) / 1e6:.2f} MB")
+            if 'dtensor_internal_attrs' in analysis:
+                logging.info(f"  Internal attrs: {list(analysis['dtensor_internal_attrs'].keys())}")
+        logging.info("="*80)
 
         # Gather and send parameter metadata to broadcaster
         param_meta = gather_dtensor_param_metadata(model)
