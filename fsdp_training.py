@@ -250,14 +250,30 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
     num_epochs = 2
+    
+    # Track total training time
+    total_start_time = time.time()
+
     for epoch in range(1, num_epochs + 1):
+        epoch_start_time = time.time()
+        
         sampler.set_epoch(epoch)
         avg_loss = train_one_epoch(model, dataloader, optimizer, device, epoch, rank)
 
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+
         if rank == 0:
             logging.info(
-                f"Epoch {epoch} summary: avg_loss={avg_loss:.4f}"
+                f"Epoch {epoch} summary: avg_loss={avg_loss:.4f} | "
+                f"Time: {epoch_duration:.2f}s"
             )
+
+    total_end_time = time.time()
+    total_duration = total_end_time - total_start_time
+    
+    if rank == 0:
+        logging.info(f"Total training time: {total_duration:.2f}s")
 
     save_checkpoint_fsdp(model, optimizer, num_epochs, rank)
 
@@ -278,5 +294,5 @@ if __name__ == "__main__":
         logging.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
         
-# torchrun   --nnodes=2   --nproc_per_node=8   --node_rank=0   --master_addr=10.162.224.131   --master_port=29500   fsdp_gpt2_training.py(amd 1)
-# torchrun   --nnodes=2   --nproc_per_node=8   --node_rank=1   --master_addr=10.162.224.131   --master_port=29500   fsdp_gpt2_training.py(amd 2)
+# torchrun   --nnodes=2   --nproc_per_node=8   --node_rank=0   --master_addr=10.162.224.131   --master_port=29500   fsdp_training.py(amd 1)
+# torchrun   --nnodes=2   --nproc_per_node=8   --node_rank=1   --master_addr=10.162.224.131   --master_port=29500   fsdp_training.py(amd 2)
