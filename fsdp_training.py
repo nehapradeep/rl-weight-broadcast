@@ -6,6 +6,7 @@ import math
 import logging
 import socket
 import functools
+import itertools
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from datasets import load_dataset
 
 # FSDP Imports
 from torch.distributed.fsdp import (
@@ -96,32 +98,70 @@ def log_gpu_info():
     )
 
 # -----------------------------------------------------------
-# Dummy Dataset
+# Dataset: WikiText-2
 # -----------------------------------------------------------
-def get_dummy_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 64, dataset_size: int = 1024):
-    text = "Hello world! This is a dummy dataset for testing distributed training. " * 100
-    enc = tokenizer(text, return_tensors="pt")
-    input_ids = enc["input_ids"][0]
+def get_wikitext_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 128):
+    """
+    Loads WikiText-2, tokenizes it, and chunks it into sequences of seq_len.
+    """
+    # Only main process on each node should ideally manage downloads, 
+    # but 'datasets' uses file locking, so it's safe to call on all ranks.
+    # We suppress progress bars on non-zero local ranks to keep logs clean.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank != 0:
+        import datasets
+        datasets.logging.set_verbosity_error()
+        
+    logging.info("Loading WikiText-2 dataset...")
+    # Using 'wikitext-2-raw-v1' (no pre-processing)
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
-    if len(input_ids) < seq_len:
-        input_ids = input_ids.repeat(math.ceil(seq_len / len(input_ids)))
+    logging.info("Tokenizing WikiText-2...")
+    
+    def tokenize_function(examples):
+        return tokenizer(examples["text"])
 
-    samples = []
-    for i in range(dataset_size):
-        start = (i * seq_len) % (len(input_ids) - seq_len - 1)
-        end = start + seq_len
-        x = input_ids[start:end]
-        y = input_ids[start + 1 : end + 1]
-        samples.append((x, y))
+    # Tokenize the dataset
+    tokenized_datasets = dataset.map(
+        tokenize_function, 
+        batched=True, 
+        num_proc=4, 
+        remove_columns=["text"]
+    )
 
-    class DummyDataset(torch.utils.data.Dataset):
-        def __init__(self, samples): self.samples = samples
-        def __len__(self): return len(self.samples)
+    logging.info("Flattening and chunking dataset...")
+    # Flatten all input_ids into one long list
+    all_input_ids = list(itertools.chain(*tokenized_datasets["input_ids"]))
+    
+    # Create tensor
+    # We need to ensure we can create samples of (seq_len) plus 1 token for label
+    total_tokens = len(all_input_ids)
+    
+    # Convert to tensor
+    data_tensor = torch.tensor(all_input_ids, dtype=torch.long)
+    
+    class WikiTextDataset(torch.utils.data.Dataset):
+        def __init__(self, data, seq_len):
+            self.data = data
+            self.seq_len = seq_len
+            # Calculate how many full blocks we can make
+            # We need block_size + 1 (for next token prediction)
+            self.num_samples = (len(self.data) - 1) // self.seq_len
+
+        def __len__(self):
+            return self.num_samples
+
         def __getitem__(self, idx):
-            x, y = self.samples[idx]
-            return x.clone(), y.clone()
+            start = idx * self.seq_len
+            end = start + self.seq_len
+            
+            # x is input, y is target (shifted by 1)
+            x = self.data[start : end]
+            y = self.data[start+1 : end+1]
+            return x, y
 
-    return DummyDataset(samples)
+    logging.info(f"Dataset created: {total_tokens} tokens, {(total_tokens-1)//seq_len} samples.")
+    return WikiTextDataset(data_tensor, seq_len)
 
 # -----------------------------------------------------------
 # Training Helpers
@@ -242,8 +282,8 @@ def main():
 
     logging.info(f"Model wrapped with FSDP.")
 
-    # Dataset
-    dataset = get_dummy_dataset(tokenizer, seq_len=64, dataset_size=512)
+    # Dataset (UPDATED)
+    dataset = get_wikitext_dataset(tokenizer, seq_len=128)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     dataloader = DataLoader(dataset, batch_size=4, sampler=sampler, num_workers=2)
 
