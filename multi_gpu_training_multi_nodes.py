@@ -17,6 +17,14 @@ import torch.nn as nn
 import json
 import numpy as np
 
+# DTensor utilities
+from utils.dtensor_utils import (
+    compute_gpu_shard_assignments,
+    get_current_gpu_shard_info,
+    mesh_coordinate_to_gpu_index,
+    gpu_index_to_mesh_coordinate
+)
+
 # ---------------------------
 # DTensor parameter metadata helpers
 # ---------------------------
@@ -117,38 +125,50 @@ def analyze_dtensor_layout(dtensor, param_name="unknown"):
     # For sharded tensors, we need to figure out shard assignment
     if analysis.get("layout_strategy") == "sharded" and "mesh" in analysis:
         mesh = dtensor.device_mesh
-        devices = mesh.devices
-        mesh_shape = mesh.shape
+        global_shape = dtensor.shape
         
-        # Calculate shard assignment per GPU
-        gpu_assignments = []
-        
-        # For 1D mesh with Shard placement, each GPU gets a contiguous slice
-        if len(mesh_shape) == 1 and len(placements) == 1:
-            placement = placements[0]
-            if isinstance(placement, Shard):
-                shard_dim = placement.dim
-                global_shape = dtensor.shape
-                
-                if shard_dim < len(global_shape):
-                    dim_size = global_shape[shard_dim]
-                    num_shards = mesh_shape[0]
-                    shard_size = dim_size // num_shards
-                    remainder = dim_size % num_shards
-                    
-                    for gpu_idx in range(num_shards):
-                        shard_start = gpu_idx * shard_size + min(gpu_idx, remainder)
-                        shard_end = shard_start + shard_size + (1 if gpu_idx < remainder else 0)
+        try:
+            # Use comprehensive shard assignment computation
+            gpu_assignments = compute_gpu_shard_assignments(
+                dtensor, mesh, placements, global_shape
+            )
+            
+            # Also get current GPU's shard info if available
+            current_gpu_info = get_current_gpu_shard_info(dtensor, mesh)
+            if current_gpu_info:
+                analysis["current_gpu_shard"] = current_gpu_info
+            
+            analysis["gpu_assignments"] = gpu_assignments
+        except Exception as e:
+            # Fallback to basic calculation if comprehensive one fails
+            logging.warning(f"Comprehensive shard assignment failed for {param_name}: {e}. Using fallback.")
+            analysis["gpu_assignments_error"] = str(e)
+            
+            # Simple fallback for 1D mesh
+            mesh_shape = list(mesh.shape)
+            if len(mesh_shape) == 1 and len(placements) == 1:
+                placement = placements[0]
+                if isinstance(placement, Shard):
+                    shard_dim = placement.dim
+                    if shard_dim < len(global_shape):
+                        dim_size = global_shape[shard_dim]
+                        num_shards = mesh_shape[0]
+                        devices = mesh.devices
                         
-                        gpu_assignments.append({
-                            "gpu_index": gpu_idx,
-                            "device": str(devices[gpu_idx]),
-                            "shard_dim": shard_dim,
-                            "shard_slice": (shard_start, shard_end),
-                            "shard_size": shard_end - shard_start,
-                        })
-        
-        analysis["gpu_assignments"] = gpu_assignments
+                        gpu_assignments = []
+                        for gpu_idx in range(num_shards):
+                            shard_start = (gpu_idx * dim_size) // num_shards
+                            shard_end = ((gpu_idx + 1) * dim_size) // num_shards
+                            
+                            gpu_assignments.append({
+                                "gpu_index": gpu_idx,
+                                "device": str(devices[gpu_idx]) if gpu_idx < len(devices) else f"unknown_{gpu_idx}",
+                                "shard_slices": {shard_dim: (shard_start, shard_end)},
+                                "shard_shape": list(global_shape),
+                            })
+                            gpu_assignments[-1]["shard_shape"][shard_dim] = shard_end - shard_start
+                        
+                        analysis["gpu_assignments"] = gpu_assignments
     
     # 5. Try to get global tensor size
     try:
@@ -749,9 +769,18 @@ def main():
             if 'gpu_assignments' in analysis and analysis['gpu_assignments']:
                 logging.info(f"  GPU assignments: {len(analysis['gpu_assignments'])} GPUs")
                 for gpu_assignment in analysis['gpu_assignments'][:3]:  # Show first 3
-                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}): "
-                               f"shard_slice={gpu_assignment.get('shard_slice')}, "
-                               f"size={gpu_assignment.get('shard_size')}")
+                    mesh_coord = gpu_assignment.get('mesh_coordinate', 'N/A')
+                    shard_slices = gpu_assignment.get('shard_slices', {})
+                    shard_shape = gpu_assignment.get('shard_shape', 'N/A')
+                    size_bytes = gpu_assignment.get('size_bytes', 0)
+                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}):")
+                    logging.info(f"      mesh_coord={mesh_coord}, shard_slices={shard_slices}")
+                    logging.info(f"      shard_shape={shard_shape}, size={size_bytes/1e6:.2f} MB")
+            if 'current_gpu_shard' in analysis:
+                current = analysis['current_gpu_shard']
+                logging.info(f"  Current GPU shard: GPU {current.get('gpu_index')}, "
+                          f"mesh_coord={current.get('mesh_coordinate')}, "
+                          f"shard_slices={current.get('shard_slices')}")
             if 'global_size' in analysis:
                 global_size = analysis['global_size']
                 logging.info(f"  Global size: {global_size.get('size_bytes', 0) / 1e6:.2f} MB")
@@ -826,9 +855,18 @@ def main():
             if 'gpu_assignments' in analysis and analysis['gpu_assignments']:
                 logging.info(f"  GPU assignments: {len(analysis['gpu_assignments'])} GPUs")
                 for gpu_assignment in analysis['gpu_assignments'][:3]:  # Show first 3
-                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}): "
-                               f"shard_slice={gpu_assignment.get('shard_slice')}, "
-                               f"size={gpu_assignment.get('shard_size')}")
+                    mesh_coord = gpu_assignment.get('mesh_coordinate', 'N/A')
+                    shard_slices = gpu_assignment.get('shard_slices', {})
+                    shard_shape = gpu_assignment.get('shard_shape', 'N/A')
+                    size_bytes = gpu_assignment.get('size_bytes', 0)
+                    logging.info(f"    GPU {gpu_assignment['gpu_index']} ({gpu_assignment['device']}):")
+                    logging.info(f"      mesh_coord={mesh_coord}, shard_slices={shard_slices}")
+                    logging.info(f"      shard_shape={shard_shape}, size={size_bytes/1e6:.2f} MB")
+            if 'current_gpu_shard' in analysis:
+                current = analysis['current_gpu_shard']
+                logging.info(f"  Current GPU shard: GPU {current.get('gpu_index')}, "
+                          f"mesh_coord={current.get('mesh_coordinate')}, "
+                          f"shard_slices={current.get('shard_slices')}")
             if 'global_size' in analysis:
                 global_size = analysis['global_size']
                 logging.info(f"  Global size: {global_size.get('size_bytes', 0) / 1e6:.2f} MB")
