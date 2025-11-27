@@ -1,0 +1,97 @@
+2025-11-27 09:22:22 | Rank 0 | INFO | Logging initialized. Log file: logs/rank_0_20251127_092222.log
+2025-11-27 09:22:22 | Rank 0 | INFO | Init: rank=0, world_size=1
+2025-11-27 09:22:22 | Rank 0 | INFO | [NODE SUMMARY] host=chi-mi325x-pod2-100.ord.vultr.cpe.ice.amd.com node_rank=unknown num_gpus_visible=8 world_size=1
+2025-11-27 09:22:22 | Rank 0 | INFO | [RANK MAP] global_rank=0 node_rank=unknown local_rank=0 cuda_device=0 host=chi-mi325x-pod2-100.ord.vultr.cpe.ice.amd.com
+2025-11-27 09:22:22 | Rank 0 | INFO | Using CUDA device index 0
+2025-11-27 09:22:22 | Rank 0 | INFO | Loading model and tokenizer for: Qwen/Qwen2.5-0.5B
+2025-11-27 09:22:22 | Rank 0 | INFO | Loading model: Qwen/Qwen2.5-0.5B
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Starting new HTTPS connection (1): huggingface.co:443
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/tokenizer_config.json HTTP/1.1" 307 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/tokenizer_config.json HTTP/1.1" 200 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973056272544 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/ba7e4c5637b9732dadcd66286ce48334e8b31e9e.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973056272544 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/ba7e4c5637b9732dadcd66286ce48334e8b31e9e.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/tokenizer_config.json HTTP/1.1" 200 None
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to release lock 139973056272544 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/ba7e4c5637b9732dadcd66286ce48334e8b31e9e.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973056272544 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/ba7e4c5637b9732dadcd66286ce48334e8b31e9e.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/Qwen/Qwen2.5-0.5B/tree/main/additional_chat_templates?recursive=False&expand=False HTTP/1.1" 404 64
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/vocab.json HTTP/1.1" 307 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/vocab.json HTTP/1.1" 200 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973276109696 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/4783fe10ac3adce15ac8f358ef5462739852c569.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109696 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/4783fe10ac3adce15ac8f358ef5462739852c569.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/vocab.json HTTP/1.1" 200 None
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to release lock 139973276109696 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/4783fe10ac3adce15ac8f358ef5462739852c569.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109696 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/4783fe10ac3adce15ac8f358ef5462739852c569.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/merges.txt HTTP/1.1" 307 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/merges.txt HTTP/1.1" 200 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973276109696 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109696 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/merges.txt HTTP/1.1" 200 None
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to release lock 139973276109696 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109696 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/20024bfe7c83998e9aeaf98a0cd6a2ce6306c2f0.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/tokenizer.json HTTP/1.1" 307 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/tokenizer.json HTTP/1.1" 200 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973276109648 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/443909a61d429dff23010e5bddd28ff530edda00.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109648 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/443909a61d429dff23010e5bddd28ff530edda00.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/tokenizer.json HTTP/1.1" 200 None
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to release lock 139973276109648 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/443909a61d429dff23010e5bddd28ff530edda00.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973276109648 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/443909a61d429dff23010e5bddd28ff530edda00.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/added_tokens.json HTTP/1.1" 404 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/special_tokens_map.json HTTP/1.1" 404 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/chat_template.jinja HTTP/1.1" 404 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/config.json HTTP/1.1" 307 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/config.json HTTP/1.1" 200 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973043540496 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/141506237b9022c4ab3e01734cfafb9310b57d2d.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973043540496 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/141506237b9022c4ab3e01734cfafb9310b57d2d.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/config.json HTTP/1.1" 200 681
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to release lock 139973043540496 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/141506237b9022c4ab3e01734cfafb9310b57d2d.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973043540496 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/141506237b9022c4ab3e01734cfafb9310b57d2d.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/model.safetensors HTTP/1.1" 302 0
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Attempting to acquire lock 139973043544480 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342.lock
+2025-11-27 09:22:22 | Rank 0 | DEBUG | Lock 139973043544480 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342.lock
+2025-11-27 09:22:23 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/Qwen/Qwen2.5-0.5B/xet-read-token/060db6499f32faf8b98477b0a26969ef7d8b9987 HTTP/1.1" 200 365
+2025-11-27 09:22:24 | Rank 0 | DEBUG | Attempting to release lock 139973043544480 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342.lock
+2025-11-27 09:22:24 | Rank 0 | DEBUG | Lock 139973043544480 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/88c142557820ccad55bb59756bfcfcf891de9cc6202816bd346445188a0ed342.lock
+2025-11-27 09:22:25 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/generation_config.json HTTP/1.1" 307 0
+2025-11-27 09:22:25 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/generation_config.json HTTP/1.1" 200 0
+2025-11-27 09:22:25 | Rank 0 | DEBUG | Attempting to acquire lock 139973055994448 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/cbbb3133034e192527e5321b4c679154e4819ab8.lock
+2025-11-27 09:22:25 | Rank 0 | DEBUG | Lock 139973055994448 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/cbbb3133034e192527e5321b4c679154e4819ab8.lock
+2025-11-27 09:22:25 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/Qwen/Qwen2.5-0.5B/060db6499f32faf8b98477b0a26969ef7d8b9987/generation_config.json HTTP/1.1" 200 138
+2025-11-27 09:22:25 | Rank 0 | DEBUG | Attempting to release lock 139973055994448 on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/cbbb3133034e192527e5321b4c679154e4819ab8.lock
+2025-11-27 09:22:25 | Rank 0 | DEBUG | Lock 139973055994448 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--Qwen--Qwen2.5-0.5B/cbbb3133034e192527e5321b4c679154e4819ab8.lock
+2025-11-27 09:22:25 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /Qwen/Qwen2.5-0.5B/resolve/main/custom_generate/generate.py HTTP/1.1" 404 0
+2025-11-27 09:22:26 | Rank 0 | INFO | Starting epoch 1 with 128 batches
+2025-11-27 09:22:31 | Rank 0 | INFO | Epoch 1 | Batch 0/128 | Loss: 10.5478
+2025-11-27 09:22:31 | Rank 0 | INFO | Epoch 1 | Batch 10/128 | Loss: nan
+2025-11-27 09:22:31 | Rank 0 | INFO | Epoch 1 | Batch 20/128 | Loss: nan
+2025-11-27 09:22:32 | Rank 0 | INFO | Epoch 1 | Batch 30/128 | Loss: nan
+2025-11-27 09:22:32 | Rank 0 | INFO | Epoch 1 | Batch 40/128 | Loss: nan
+2025-11-27 09:22:33 | Rank 0 | INFO | Epoch 1 | Batch 50/128 | Loss: nan
+2025-11-27 09:22:33 | Rank 0 | INFO | Epoch 1 | Batch 60/128 | Loss: nan
+2025-11-27 09:22:34 | Rank 0 | INFO | Epoch 1 | Batch 70/128 | Loss: nan
+2025-11-27 09:22:34 | Rank 0 | INFO | Epoch 1 | Batch 80/128 | Loss: nan
+2025-11-27 09:22:35 | Rank 0 | INFO | Epoch 1 | Batch 90/128 | Loss: nan
+2025-11-27 09:22:35 | Rank 0 | INFO | Epoch 1 | Batch 100/128 | Loss: nan
+2025-11-27 09:22:36 | Rank 0 | INFO | Epoch 1 | Batch 110/128 | Loss: nan
+2025-11-27 09:22:36 | Rank 0 | INFO | Epoch 1 | Batch 120/128 | Loss: nan
+2025-11-27 09:22:37 | Rank 0 | INFO | Finished epoch 1 | Average loss: nan
+2025-11-27 09:22:37 | Rank 0 | INFO | Epoch 1 summary: avg_loss=nan
+2025-11-27 09:22:37 | Rank 0 | INFO | Starting epoch 2 with 128 batches
+2025-11-27 09:22:38 | Rank 0 | INFO | Epoch 2 | Batch 0/128 | Loss: nan
+2025-11-27 09:22:39 | Rank 0 | INFO | Epoch 2 | Batch 10/128 | Loss: nan
+2025-11-27 09:22:39 | Rank 0 | INFO | Epoch 2 | Batch 20/128 | Loss: nan
+2025-11-27 09:22:40 | Rank 0 | INFO | Epoch 2 | Batch 30/128 | Loss: nan
+2025-11-27 09:22:40 | Rank 0 | INFO | Epoch 2 | Batch 40/128 | Loss: nan
+2025-11-27 09:22:41 | Rank 0 | INFO | Epoch 2 | Batch 50/128 | Loss: nan
+2025-11-27 09:22:41 | Rank 0 | INFO | Epoch 2 | Batch 60/128 | Loss: nan
+2025-11-27 09:22:42 | Rank 0 | INFO | Epoch 2 | Batch 70/128 | Loss: nan
+2025-11-27 09:22:42 | Rank 0 | INFO | Epoch 2 | Batch 80/128 | Loss: nan
+2025-11-27 09:22:43 | Rank 0 | INFO | Epoch 2 | Batch 90/128 | Loss: nan
+2025-11-27 09:22:43 | Rank 0 | INFO | Epoch 2 | Batch 100/128 | Loss: nan
+2025-11-27 09:22:43 | Rank 0 | INFO | Epoch 2 | Batch 110/128 | Loss: nan
+2025-11-27 09:22:44 | Rank 0 | INFO | Epoch 2 | Batch 120/128 | Loss: nan
+2025-11-27 09:22:44 | Rank 0 | INFO | Finished epoch 2 | Average loss: nan
+2025-11-27 09:22:44 | Rank 0 | INFO | Epoch 2 summary: avg_loss=nan
+2025-11-27 09:22:47 | Rank 0 | INFO | Checkpoint saved at: checkpoints/ddp_gpt2_wikitext2.pt
+2025-11-27 09:22:47 | Rank 0 | INFO | Destroying process group...
+2025-11-27 09:22:47 | Rank 0 | INFO | Process finished.
+2025-11-27 09:22:47 | Rank 0 | INFO | Log file: logs/rank_0_20251127_092222.log

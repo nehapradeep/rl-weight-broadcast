@@ -1,0 +1,9 @@
+2025-11-27 08:52:07 | Rank 0 | INFO | Logging initialized for trainer rank 0. Log file: logs/trainer_rank_0_20251127_085207.log
+2025-11-27 08:52:07 | Rank 0 | INFO | Trainer init: rank=0, world_size=1
+2025-11-27 08:52:07 | Rank 0 | ERROR | Trainer fatal error: Need at least 2 trainer ranks for DDP
+Traceback (most recent call last):
+  File "/home/yangzhou/rl_weights_rdma/john/rl-weight-broadcast/ddp_trainer.py", line 350, in <module>
+    main()
+  File "/home/yangzhou/rl_weights_rdma/john/rl-weight-broadcast/ddp_trainer.py", line 268, in main
+    raise RuntimeError("Need at least 2 trainer ranks for DDP")
+RuntimeError: Need at least 2 trainer ranks for DDP

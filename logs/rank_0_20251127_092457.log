@@ -1,0 +1,114 @@
+2025-11-27 09:24:57 | Rank 0 | INFO | Logging initialized. Log file: logs/rank_0_20251127_092457.log
+2025-11-27 09:24:57 | Rank 0 | INFO | Init: rank=0, world_size=1
+2025-11-27 09:24:57 | Rank 0 | INFO | [NODE SUMMARY] host=chi-mi325x-pod2-100.ord.vultr.cpe.ice.amd.com node_rank=unknown num_gpus_visible=8 world_size=1
+2025-11-27 09:24:57 | Rank 0 | INFO | [RANK MAP] global_rank=0 node_rank=unknown local_rank=0 cuda_device=0 host=chi-mi325x-pod2-100.ord.vultr.cpe.ice.amd.com
+2025-11-27 09:24:57 | Rank 0 | INFO | Using CUDA device index 0
+2025-11-27 09:24:57 | Rank 0 | INFO | Loading model and tokenizer for: facebook/opt-125m
+2025-11-27 09:24:57 | Rank 0 | INFO | Loading model: facebook/opt-125m
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Starting new HTTPS connection (1): huggingface.co:443
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/tokenizer_config.json HTTP/1.1" 307 0
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/tokenizer_config.json HTTP/1.1" 200 0
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Attempting to acquire lock 139630544722656 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/27c24ca9d908d0b678b20c698aeb9e950c44d865.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Lock 139630544722656 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/27c24ca9d908d0b678b20c698aeb9e950c44d865.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/tokenizer_config.json HTTP/1.1" 200 685
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Attempting to release lock 139630544722656 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/27c24ca9d908d0b678b20c698aeb9e950c44d865.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Lock 139630544722656 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/27c24ca9d908d0b678b20c698aeb9e950c44d865.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/config.json HTTP/1.1" 307 0
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/config.json HTTP/1.1" 200 0
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Attempting to acquire lock 139630544452624 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/b3fb716a3024261980becb2382e31a3780985130.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Lock 139630544452624 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/b3fb716a3024261980becb2382e31a3780985130.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/config.json HTTP/1.1" 200 651
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Attempting to release lock 139630544452624 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/b3fb716a3024261980becb2382e31a3780985130.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | Lock 139630544452624 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/b3fb716a3024261980becb2382e31a3780985130.lock
+2025-11-27 09:24:57 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/tree/main/additional_chat_templates?recursive=False&expand=False HTTP/1.1" 404 64
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/vocab.json HTTP/1.1" 307 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/vocab.json HTTP/1.1" 200 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to acquire lock 139630765066992 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/0a39732b2d8be8e493cab3da68b68cc3e28221de.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630765066992 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/0a39732b2d8be8e493cab3da68b68cc3e28221de.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/vocab.json HTTP/1.1" 200 None
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to release lock 139630765066992 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/0a39732b2d8be8e493cab3da68b68cc3e28221de.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630765066992 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/0a39732b2d8be8e493cab3da68b68cc3e28221de.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/merges.txt HTTP/1.1" 307 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/merges.txt HTTP/1.1" 200 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to acquire lock 139630544721648 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/226b0752cac7789c48f0cb3ec53eda48b7be36cc.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630544721648 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/226b0752cac7789c48f0cb3ec53eda48b7be36cc.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/merges.txt HTTP/1.1" 200 None
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to release lock 139630544721648 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/226b0752cac7789c48f0cb3ec53eda48b7be36cc.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630544721648 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/226b0752cac7789c48f0cb3ec53eda48b7be36cc.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/tokenizer.json HTTP/1.1" 404 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/added_tokens.json HTTP/1.1" 404 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/special_tokens_map.json HTTP/1.1" 307 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/special_tokens_map.json HTTP/1.1" 200 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to acquire lock 139630544722080 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/5dfa36546b8eddce0e04df3133c30df43fcc3828.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630544722080 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/5dfa36546b8eddce0e04df3133c30df43fcc3828.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/special_tokens_map.json HTTP/1.1" 200 441
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to release lock 139630544722080 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/5dfa36546b8eddce0e04df3133c30df43fcc3828.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630544722080 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/5dfa36546b8eddce0e04df3133c30df43fcc3828.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/chat_template.jinja HTTP/1.1" 404 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/config.json HTTP/1.1" 307 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/config.json HTTP/1.1" 200 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/model.safetensors HTTP/1.1" 404 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/model.safetensors.index.json HTTP/1.1" 404 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/pytorch_model.bin HTTP/1.1" 302 0
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Attempting to acquire lock 139630544342896 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/2d74da6615135c58cf3cf9ad4cb11e7c613ff9e55fe658a47ab83b6c8d1174a9.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | Lock 139630544342896 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/2d74da6615135c58cf3cf9ad4cb11e7c613ff9e55fe658a47ab83b6c8d1174a9.lock
+2025-11-27 09:24:58 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/xet-read-token/27dcfa74d334bc871f3234de431e71c6eeba5dd6 HTTP/1.1" 200 365
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Attempting to release lock 139630544342896 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/2d74da6615135c58cf3cf9ad4cb11e7c613ff9e55fe658a47ab83b6c8d1174a9.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Lock 139630544342896 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/2d74da6615135c58cf3cf9ad4cb11e7c613ff9e55fe658a47ab83b6c8d1174a9.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/model.safetensors HTTP/1.1" 404 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Starting new HTTPS connection (1): huggingface.co:443
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m HTTP/1.1" 200 4570
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/commits/main HTTP/1.1" 200 9934
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/discussions?p=0 HTTP/1.1" 200 33074
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/commits/refs%2Fpr%2F49 HTTP/1.1" 200 10899
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/refs%2Fpr%2F49/model.safetensors.index.json HTTP/1.1" 404 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/generation_config.json HTTP/1.1" 307 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/generation_config.json HTTP/1.1" 200 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Attempting to acquire lock 139630544441440 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/cf739e3ba86db7791ebab2828cc34b8a5acd3a86.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Lock 139630544441440 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/cf739e3ba86db7791ebab2828cc34b8a5acd3a86.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/resolve-cache/models/facebook/opt-125m/27dcfa74d334bc871f3234de431e71c6eeba5dd6/generation_config.json HTTP/1.1" 200 137
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Attempting to release lock 139630544441440 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/cf739e3ba86db7791ebab2828cc34b8a5acd3a86.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Lock 139630544441440 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/cf739e3ba86db7791ebab2828cc34b8a5acd3a86.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/refs%2Fpr%2F49/model.safetensors HTTP/1.1" 302 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Attempting to acquire lock 139630545120288 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/91c4052537b74da66b7842393f45e5a9185a31fb7e675aeb9f57b29e931e5ad0.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | Lock 139630545120288 acquired on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/91c4052537b74da66b7842393f45e5a9185a31fb7e675aeb9f57b29e931e5ad0.lock
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "HEAD /facebook/opt-125m/resolve/main/custom_generate/generate.py HTTP/1.1" 404 0
+2025-11-27 09:24:59 | Rank 0 | DEBUG | https://huggingface.co:443 "GET /api/models/facebook/opt-125m/xet-read-token/67b7aed3f6d278c762d17c0893a5edc315f48e96 HTTP/1.1" 200 365
+2025-11-27 09:25:00 | Rank 0 | INFO | Starting epoch 1 with 128 batches
+2025-11-27 09:25:00 | Rank 0 | DEBUG | Attempting to release lock 139630545120288 on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/91c4052537b74da66b7842393f45e5a9185a31fb7e675aeb9f57b29e931e5ad0.lock
+2025-11-27 09:25:00 | Rank 0 | DEBUG | Lock 139630545120288 released on /home/yangzhou/.cache/huggingface/hub/.locks/models--facebook--opt-125m/91c4052537b74da66b7842393f45e5a9185a31fb7e675aeb9f57b29e931e5ad0.lock
+2025-11-27 09:25:03 | Rank 0 | INFO | Epoch 1 | Batch 0/128 | Loss: 10.9795
+2025-11-27 09:25:03 | Rank 0 | INFO | Epoch 1 | Batch 10/128 | Loss: nan
+2025-11-27 09:25:03 | Rank 0 | INFO | Epoch 1 | Batch 20/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 30/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 40/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 50/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 60/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 70/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 80/128 | Loss: nan
+2025-11-27 09:25:04 | Rank 0 | INFO | Epoch 1 | Batch 90/128 | Loss: nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Epoch 1 | Batch 100/128 | Loss: nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Epoch 1 | Batch 110/128 | Loss: nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Epoch 1 | Batch 120/128 | Loss: nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Finished epoch 1 | Average loss: nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Epoch 1 summary: avg_loss=nan
+2025-11-27 09:25:05 | Rank 0 | INFO | Starting epoch 2 with 128 batches
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 0/128 | Loss: nan
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 10/128 | Loss: nan
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 20/128 | Loss: nan
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 30/128 | Loss: nan
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 40/128 | Loss: nan
+2025-11-27 09:25:06 | Rank 0 | INFO | Epoch 2 | Batch 50/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 60/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 70/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 80/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 90/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 100/128 | Loss: nan
+2025-11-27 09:25:07 | Rank 0 | INFO | Epoch 2 | Batch 110/128 | Loss: nan
+2025-11-27 09:25:08 | Rank 0 | INFO | Epoch 2 | Batch 120/128 | Loss: nan
+2025-11-27 09:25:08 | Rank 0 | INFO | Finished epoch 2 | Average loss: nan
+2025-11-27 09:25:08 | Rank 0 | INFO | Epoch 2 summary: avg_loss=nan
+2025-11-27 09:25:08 | Rank 0 | INFO | Checkpoint saved at: checkpoints/ddp_gpt2_wikitext2.pt
+2025-11-27 09:25:08 | Rank 0 | INFO | Destroying process group...
+2025-11-27 09:25:09 | Rank 0 | INFO | Process finished.
+2025-11-27 09:25:09 | Rank 0 | INFO | Log file: logs/rank_0_20251127_092457.log
