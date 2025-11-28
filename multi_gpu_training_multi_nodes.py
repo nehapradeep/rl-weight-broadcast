@@ -9,6 +9,11 @@ import math
 # DTensor setup
 from torch.distributed.device_mesh import DeviceMesh
 
+# FSDP imports
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -404,14 +409,18 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
 
 
 # ---------------------------
-# Training (rank 1)
+# Training (FSDP)
 # ---------------------------
-def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
-    """Training loop for rank 1 (supports DataParallel)"""
+def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=None):
+    """Training loop with FSDP support"""
+    is_fsdp = isinstance(model, FSDP)
     logging.info("="*80)
-    logging.info("TRAINING NODE - Starting training on WikiText-2")
+    logging.info("TRAINING - Starting training on WikiText-2")
+    logging.info(f"Model type: {'FSDP' if is_fsdp else 'Standard'}")
     logging.info(f"Visible GPUs on this node: {torch.cuda.device_count()}")
     logging.info(f"Model class: {model.__class__.__name__}")
+    if train_group:
+        logging.info(f"Training process group size: {dist.get_world_size(train_group)}")
     logging.info("="*80)
     
     train_dataset = prepare_dataset(tokenizer, max_length=128, num_samples=200)
@@ -455,12 +464,9 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
             # Move batch to GPU 0; DataParallel will scatter internally if enabled
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
-            # Convert batch tensors to Dtensors
-            if torch.cuda.device_count() > 1:
-                mesh_devices = list(range(torch.cuda.device_count()))
-                device_mesh = DeviceMesh("cuda", mesh_devices)
-            else:
-                device_mesh = DeviceMesh("cuda", [0])
+            # Convert batch tensors to Dtensors (using single-GPU mesh since DeviceMesh must match process group)
+            # DataParallel handles multi-GPU distribution
+            device_mesh = DeviceMesh("cuda", [0])
             input_ids = DTensor(input_ids, device_mesh, [Replicate()])
             attention_mask = DTensor(attention_mask, device_mesh, [Replicate()])
             
@@ -470,9 +476,9 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
                 attention_mask=attention_mask,
                 labels=input_ids
             )
-            loss = outputs.loss  # can be scalar or vector (per-GPU) with DataParallel
+            loss = outputs.loss
             
-            # ---- MULTI-GPU SAFE LOSS REDUCTION ----
+            # FSDP handles loss reduction automatically, but ensure it's a scalar
             if isinstance(loss, torch.Tensor) and loss.dim() > 0:
                 loss_scalar = loss.mean()
             else:
@@ -536,8 +542,13 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # If DataParallel is used, save underlying module
-    save_model = model.module if isinstance(model, nn.DataParallel) else model
+    # If DataParallel or FSDP is used, get underlying module
+    if isinstance(model, nn.DataParallel):
+        save_model = model.module
+    elif isinstance(model, FSDP):
+        save_model = model.module
+    else:
+        save_model = model
     checkpoint_path = f"{checkpoint_dir}/model_rank1_wikitext2_trained.pt"
     torch.save({
         'model_state_dict': save_model.state_dict(),
@@ -586,12 +597,9 @@ def run_inference(model, tokenizer, num_samples=5):
             
             inputs = tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].cuda()
-            # Convert input_ids to Dtensor
-            if torch.cuda.device_count() > 1:
-                mesh_devices = list(range(torch.cuda.device_count()))
-                device_mesh = DeviceMesh("cuda", mesh_devices)
-            else:
-                device_mesh = DeviceMesh("cuda", [0])
+            # Convert input_ids to Dtensor (using single-GPU mesh since DeviceMesh must match process group)
+            # DataParallel handles multi-GPU distribution if needed
+            device_mesh = DeviceMesh("cuda", [0])
             input_ids = DTensor(input_ids, device_mesh, [Replicate()])
             
             generation_start = time.perf_counter()
@@ -648,20 +656,51 @@ def main():
     log_file = setup_logging(rank)
     
     logging.info(f"Process started - Rank: {rank}, World size: {world_size}")
-    assert world_size == 3, "Run with three ranks (1 broadcaster + 1 training + 1 inference)."
     
+    # Architecture: Rank 0 = Broadcaster, Ranks 1 to N-2 = Trainers, Rank N-1 = Inference
+    # Example: 32 trainer GPUs -> world_size = 34 (rank 0 broadcaster, ranks 1-32 trainers, rank 33 inference)
+    assert world_size >= 3, "Need at least 3 ranks: 1 broadcaster + 1+ trainers + 1 inference"
+    
+    # Determine role based on rank
+    broadcaster_rank = 0
+    inference_rank = world_size - 1
+    trainer_ranks = list(range(1, world_size - 1))
+    num_trainers = len(trainer_ranks)
+    
+    is_broadcaster = (rank == broadcaster_rank)
+    is_trainer = (rank in trainer_ranks)
+    is_inference = (rank == inference_rank)
+    
+    logging.info(f"Role: {'Broadcaster' if is_broadcaster else 'Trainer' if is_trainer else 'Inference'}")
+    if is_trainer:
+        logging.info(f"Trainer ranks: {trainer_ranks} (total: {num_trainers} training GPUs)")
 
-    # IMPORTANT: use GPU 0 on each node; trainer uses DataParallel internally
+    # Setup CUDA device - use LOCAL_RANK for multi-GPU per node, or rank-based assignment
     if torch.cuda.is_available():
-        local_gpu = 0
-        torch.cuda.set_device(local_gpu)
-        logging.info(f"CUDA device set to GPU {local_gpu}")
-        mesh_devices = list(range(torch.cuda.device_count()))
-        device_mesh = DeviceMesh("cuda", mesh_devices)
+        # Use LOCAL_RANK if set (torchrun sets this), otherwise use rank % GPUs_per_node
+        local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+        torch.cuda.set_device(local_rank)
+        local_gpu = torch.cuda.current_device()
+        num_gpus = torch.cuda.device_count()
+        logging.info(f"CUDA device set to GPU {local_gpu} (local_rank={local_rank})")
+        logging.info(f"Total GPUs on this node: {num_gpus}")
+        
+        # DeviceMesh for DTensor (single GPU per process)
+        device_mesh = DeviceMesh("cuda", [0])
+        logging.info(f"DeviceMesh created with single GPU")
     else:
         local_gpu = None
+        local_rank = None
         device_mesh = None
         logging.info("CUDA not available. (RDMA will not work.)")
+    
+    # Create process groups for FSDP
+    # Training process group: only includes trainer ranks (excludes broadcaster/inference)
+    if is_trainer:
+        logging.info(f"Creating training process group with ranks: {trainer_ranks}")
+        train_group = dist.new_group(ranks=trainer_ranks)
+    else:
+        train_group = None
     
     logging.info("Initializing P2P endpoint...")
     ep = p2p.Endpoint(local_gpu, 4)
@@ -686,25 +725,27 @@ def main():
     metadata_time = time.perf_counter() - metadata_start
     logging.info(f"Metadata exchange complete in {metadata_time:.2f}s")
     
-    if rank == 0:
+    if is_broadcaster:
         # Broadcaster
         logging.info("="*80)
         logging.info("BROADCASTER MODE")
         logging.info("="*80)
         logging.info("Connecting to receivers...")
         conn_ids = []
-        for receiver_rank in [1, 2]:
+        # Connect to all trainer ranks and inference rank
+        receiver_ranks = trainer_ranks + [inference_rank]
+        for receiver_rank in receiver_ranks:
             ip, port, r_gpu = p2p.Endpoint.parse_metadata(all_metadata[receiver_rank])
             logging.info(f"Connecting to rank {receiver_rank}: IP={ip}, Port={port}, GPU={r_gpu}")
             ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
             assert ok, f"Connect failed to rank {receiver_rank}"
             conn_ids.append(conn_id)
-            node_type = "Training Node" if receiver_rank == 1 else "Inference Node"
+            node_type = "Training GPU" if receiver_rank in trainer_ranks else "Inference Node"
             logging.info(f"Connected to {node_type} (rank {receiver_rank}, conn_id={conn_id})")
 
-        # Receive parameter metadata from trainer and inference nodes
+        # Receive parameter metadata from all trainer ranks and inference node
         param_metadata = {}
-        for src_rank in [1, 2]:
+        for src_rank in receiver_ranks:
             logging.info(f"Receiving parameter metadata from rank {src_rank}...")
             size_tensor = torch.zeros(1, dtype=torch.int32)
             dist.recv(size_tensor, src=src_rank)
@@ -722,10 +763,10 @@ def main():
 
         logging.info("Broadcaster setup complete. Ready for further operations.")
     
-    elif rank == 1:
+    elif is_trainer:
         # Trainer
         logging.info("="*80)
-        logging.info("TRAINING NODE (Rank 1)")
+        logging.info(f"TRAINING GPU (Rank {rank})")
         logging.info("="*80)
         logging.info("Waiting for broadcaster connection...")
         ok, r_ip, r_gpu, conn_id = ep.accept()
@@ -799,20 +840,27 @@ def main():
 
         recv_model(ep, conn_id, base_model, rank)
 
-        if torch.cuda.device_count() > 1:
-            device_ids = list(range(torch.cuda.device_count()))
-            logging.info(f"Wrapping model in DataParallel across GPUs: {device_ids}")
-            model = nn.DataParallel(base_model, device_ids=device_ids)
-        else:
-            logging.info("Only one GPU detected; using single-GPU training.")
-            model = base_model
+        # Wrap model with FSDP for distributed training across all trainer GPUs
+        logging.info(f"Wrapping model with FSDP across {num_trainers} training GPUs...")
+        auto_wrap_policy = transformer_auto_wrap_policy(
+            transformer_layer_cls={GPT2Block}
+        )
+        
+        model = FSDP(
+            base_model,
+            auto_wrap_policy=auto_wrap_policy,
+            process_group=train_group,  # CRITICAL: Use training group, not global group
+            device_id=local_gpu,
+            mixed_precision=None,  # Can enable mixed precision here if needed
+        )
+        logging.info("Model wrapped with FSDP. Parameters will be sharded across training GPUs.")
 
-        run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5)
+        run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=train_group)
     
-    else:
-        # Inference node (rank 2)
+    elif is_inference:
+        # Inference node
         logging.info("="*80)
-        logging.info("INFERENCE NODE (Rank 2)")
+        logging.info(f"INFERENCE NODE (Rank {rank})")
         logging.info("="*80)
         logging.info("Waiting for broadcaster connection...")
         ok, r_ip, r_gpu, conn_id = ep.accept()
