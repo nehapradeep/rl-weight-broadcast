@@ -10,13 +10,18 @@ import math
 from torch.distributed.device_mesh import DeviceMesh
 
 # FSDP imports
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+)
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from uccl import p2p
 import torch.nn as nn
 import json
@@ -411,7 +416,7 @@ def prepare_dataset(tokenizer, max_length=128, num_samples=200):
 # ---------------------------
 # Training (FSDP)
 # ---------------------------
-def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=None):
+def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=None, rank=None):
     """Training loop with FSDP support"""
     is_fsdp = isinstance(model, FSDP)
     logging.info("="*80)
@@ -419,16 +424,31 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_gr
     logging.info(f"Model type: {'FSDP' if is_fsdp else 'Standard'}")
     logging.info(f"Visible GPUs on this node: {torch.cuda.device_count()}")
     logging.info(f"Model class: {model.__class__.__name__}")
-    if train_group:
-        logging.info(f"Training process group size: {dist.get_world_size(train_group)}")
-    logging.info("="*80)
     
     train_dataset = prepare_dataset(tokenizer, max_length=128, num_samples=200)
+    
+    # Use DistributedSampler for proper data distribution across training GPUs
+    if train_group is not None:
+        train_group_size = dist.get_world_size(train_group)
+        train_group_rank = dist.get_rank(train_group)
+        logging.info(f"Training process group: rank {train_group_rank}/{train_group_size}")
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=train_group_size,
+            rank=train_group_rank,
+            shuffle=True
+        )
+        logging.info(f"Using DistributedSampler: rank {train_group_rank}/{train_group_size} in training group")
+    else:
+        sampler = None
+        logging.info("No training group provided, using regular DataLoader (not recommended for FSDP)")
     
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True
+        sampler=sampler,
+        shuffle=(sampler is None),  # Only shuffle if no sampler
+        num_workers=0  # Set to 0 to avoid multiprocessing issues with RDMA
     )
     
     total_steps = len(train_dataloader) * num_epochs
@@ -452,6 +472,10 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_gr
         epoch_start = time.perf_counter()
         epoch_loss = 0.0
         epoch_perplexity = 0.0
+        
+        # Set epoch for DistributedSampler to ensure proper shuffling
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         
         logging.info(f"\n{'='*80}")
         logging.info(f"EPOCH {epoch + 1}/{num_epochs}")
@@ -542,22 +566,59 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_gr
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # If DataParallel or FSDP is used, get underlying module
-    if isinstance(model, nn.DataParallel):
+    # Save checkpoint - use FSDP state dict context manager if FSDP is used
+    if isinstance(model, FSDP):
+        # FSDP requires special handling to gather sharded parameters
+        # Get rank in training group for saving on rank 0 of training group
+        if train_group is not None:
+            train_group_rank = dist.get_rank(train_group)
+        else:
+            train_group_rank = rank
+        
+        # Policy: gather full state dict to CPU on rank 0 of training group
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        
+        # Use the context manager to gather the full state dict
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            cpu_state = model.state_dict()
+        
+        # Save on rank 0 of training group
+        if train_group_rank == 0:
+            checkpoint_path = f"{checkpoint_dir}/model_fsdp_wikitext2_trained.pt"
+            state = {
+                'model_state_dict': cpu_state,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch_losses': epoch_losses,
+                'total_steps': total_steps,
+                'final_loss': epoch_losses[-1],
+            }
+            torch.save(state, checkpoint_path)
+            logging.info(f"Model checkpoint saved to: {checkpoint_path}")
+        else:
+            logging.info(f"Rank {train_group_rank} in training group - checkpoint saved on rank 0")
+    elif isinstance(model, nn.DataParallel):
+        # DataParallel: get underlying module
         save_model = model.module
-    elif isinstance(model, FSDP):
-        save_model = model.module
+        checkpoint_path = f"{checkpoint_dir}/model_dataparallel_wikitext2_trained.pt"
+        torch.save({
+            'model_state_dict': save_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch_losses': epoch_losses,
+            'total_steps': total_steps,
+            'final_loss': epoch_losses[-1],
+        }, checkpoint_path)
+        logging.info(f"Model checkpoint saved to: {checkpoint_path}")
     else:
-        save_model = model
-    checkpoint_path = f"{checkpoint_dir}/model_rank1_wikitext2_trained.pt"
-    torch.save({
-        'model_state_dict': save_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'epoch_losses': epoch_losses,
-        'total_steps': total_steps,
-        'final_loss': epoch_losses[-1],
-    }, checkpoint_path)
-    logging.info(f"Model checkpoint saved to: {checkpoint_path}")
+        # Regular model
+        checkpoint_path = f"{checkpoint_dir}/model_wikitext2_trained.pt"
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch_losses': epoch_losses,
+            'total_steps': total_steps,
+            'final_loss': epoch_losses[-1],
+        }, checkpoint_path)
+        logging.info(f"Model checkpoint saved to: {checkpoint_path}")
 
 
 # ---------------------------
@@ -649,7 +710,18 @@ def run_inference(model, tokenizer, num_samples=5):
 # Main (all ranks)
 # ---------------------------
 def main():
-    dist.init_process_group(backend="gloo")
+    # Use NCCL backend for better multi-GPU performance (requires CUDA)
+    # Fallback to gloo if NCCL not available (e.g., CPU-only or some edge cases)
+    if torch.cuda.is_available():
+        try:
+            dist.init_process_group(backend="nccl", init_method="env://")
+            logging.info("Initialized process group with NCCL backend")
+        except Exception as e:
+            logging.warning(f"Failed to initialize NCCL backend: {e}. Falling back to gloo.")
+            dist.init_process_group(backend="gloo")
+    else:
+        dist.init_process_group(backend="gloo")
+        logging.info("Initialized process group with Gloo backend (CUDA not available)")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
@@ -855,7 +927,7 @@ def main():
         )
         logging.info("Model wrapped with FSDP. Parameters will be sharded across training GPUs.")
 
-        run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=train_group)
+        run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_group=train_group, rank=rank)
     
     elif is_inference:
         # Inference node
