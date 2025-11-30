@@ -491,8 +491,8 @@ def run_training(model, tokenizer, num_epochs=2, batch_size=4, lr=5e-5, train_gr
             # Convert batch tensors to Dtensors (using single-GPU mesh since DeviceMesh must match process group)
             # DataParallel handles multi-GPU distribution
             device_mesh = DeviceMesh("cuda", [0])
-            input_ids = DTensor(input_ids, device_mesh, [Replicate()])
-            attention_mask = DTensor(attention_mask, device_mesh, [Replicate()])
+            input_ids = DTensor.from_local(input_ids, device_mesh, [Replicate()])
+            attention_mask = DTensor.from_local(attention_mask, device_mesh, [Replicate()])
             
             # Forward pass
             outputs = model(
@@ -661,7 +661,7 @@ def run_inference(model, tokenizer, num_samples=5):
             # Convert input_ids to Dtensor (using single-GPU mesh since DeviceMesh must match process group)
             # DataParallel handles multi-GPU distribution if needed
             device_mesh = DeviceMesh("cuda", [0])
-            input_ids = DTensor(input_ids, device_mesh, [Replicate()])
+            input_ids = DTensor.from_local(input_ids, device_mesh, [Replicate()])
             
             generation_start = time.perf_counter()
             output_ids = model.generate(
@@ -780,20 +780,39 @@ def main():
     logging.info(f"Local metadata obtained (size: {len(local_md)} bytes)")
     
     # Exchange metadata
-    logging.info("Starting metadata exchange...")
+    # Use star pattern: all ranks send to broadcaster (rank 0) only
+    # This avoids O(n²) connections that cause "too many open files" error
+    logging.info("Starting metadata exchange (star pattern to rank 0)...")
     all_metadata = [None] * world_size
     all_metadata[rank] = local_md
     
+    # Determine backend type to know if we need CUDA tensors
+    backend = dist.get_backend()
+    use_cuda_tensors = (backend == "nccl" and local_gpu is not None)
+    
     metadata_start = time.perf_counter()
-    for i in range(world_size):
-        if i == rank:
-            for j in range(world_size):
-                if j != rank:
-                    dist.send(torch.ByteTensor(list(local_md)), dst=j)
-        else:
+    broadcaster_rank = 0
+    
+    if rank == broadcaster_rank:
+        # Broadcaster: receive from all other ranks
+        for src_rank in range(world_size):
+            if src_rank == rank:
+                continue  # Already have our own metadata
             remote_md = torch.zeros(len(local_md), dtype=torch.uint8)
-            dist.recv(remote_md, src=i)
-            all_metadata[i] = bytes(remote_md.tolist())
+            if use_cuda_tensors:
+                remote_md = remote_md.cuda(local_gpu)
+            dist.recv(remote_md, src=src_rank)
+            # Move back to CPU for conversion to bytes
+            if use_cuda_tensors:
+                remote_md = remote_md.cpu()
+            all_metadata[src_rank] = bytes(remote_md.tolist())
+    else:
+        # Non-broadcaster: send to broadcaster only
+        md_tensor = torch.ByteTensor(list(local_md))
+        if use_cuda_tensors:
+            md_tensor = md_tensor.cuda(local_gpu)
+        dist.send(md_tensor, dst=broadcaster_rank)
+    
     metadata_time = time.perf_counter() - metadata_start
     logging.info(f"Metadata exchange complete in {metadata_time:.2f}s")
     
@@ -820,20 +839,50 @@ def main():
         for src_rank in receiver_ranks:
             logging.info(f"Receiving parameter metadata from rank {src_rank}...")
             size_tensor = torch.zeros(1, dtype=torch.int32)
+            if use_cuda_tensors:
+                size_tensor = size_tensor.cuda(local_gpu)
             dist.recv(size_tensor, src=src_rank)
-            size = int(size_tensor.item())
+            size = int(size_tensor.cpu().item() if use_cuda_tensors else size_tensor.item())
             buf = torch.empty(size, dtype=torch.uint8)
+            if use_cuda_tensors:
+                buf = buf.cuda(local_gpu)
             dist.recv(buf, src=src_rank)
-            meta_json = buf.cpu().numpy().tobytes().decode("utf-8")
+            # Move back to CPU for conversion
+            if use_cuda_tensors:
+                buf = buf.cpu()
+            meta_json = buf.numpy().tobytes().decode("utf-8")
             param_metadata[src_rank] = json.loads(meta_json)
             logging.info(f"Received metadata from rank {src_rank}: {len(param_metadata[src_rank])} parameters")
 
         # Configure routing table using param_metadata
         logging.info("Configuring routing table with received parameter metadata...")
-        # ... Routing table logic goes here ...
-        logging.info("Routing table configured.")
+        # TODO: Implement routing table computation
+        # For each parameter:
+        #   1. Match parameter names between trainer and inference metadata
+        #   2. Determine which trainer GPU holds which shard
+        #   3. Determine which inference GPU needs which shard
+        #   4. Create routing entries: (param_name, trainer_rank, inference_rank, shard_info)
+        routing_table = {}  # Placeholder: {param_name: {trainer_rank: inference_rank, ...}}
+        logging.info("Routing table configured (placeholder - full implementation pending).")
+        
+        # Distribute routing table to all nodes (trainers and inference)
+        logging.info("Distributing routing table to all nodes...")
+        routing_table_json = json.dumps(routing_table).encode("utf-8")
+        routing_tensor = torch.tensor(np.frombuffer(routing_table_json, dtype=np.uint8).copy(), dtype=torch.uint8)
+        routing_size_tensor = torch.tensor([routing_tensor.numel()], dtype=torch.int32)
+        if use_cuda_tensors:
+            routing_tensor = routing_tensor.cuda(local_gpu)
+            routing_size_tensor = routing_size_tensor.cuda(local_gpu)
+        
+        # Send routing table to all receiver ranks
+        for receiver_rank in receiver_ranks:
+            dist.send(routing_size_tensor, dst=receiver_rank)
+            dist.send(routing_tensor, dst=receiver_rank)
+        logging.info(f"Routing table distributed to {len(receiver_ranks)} nodes.")
 
-        logging.info("Broadcaster setup complete. Ready for further operations.")
+        logging.info("Broadcaster setup complete. Routing table distributed.")
+        logging.info("Trainers and inference nodes have loaded their own models.")
+        logging.info("After training, trainers will use routing table to send weights directly to inference.")
     
     elif is_trainer:
         # Trainer
@@ -852,7 +901,7 @@ def main():
         logging.info("Model and tokenizer loaded")
         # Convert model parameters to Dtensors
         for name, param in base_model.named_parameters():
-            param.data = DTensor(param.data, device_mesh, [Replicate()])
+            param.data = DTensor.from_local(param.data, device_mesh, [Replicate()])
 
         # STEP 1: Analyze DTensor layout for sample parameters
         logging.info("="*80)
@@ -904,14 +953,36 @@ def main():
         # Gather and send parameter metadata to broadcaster
         param_meta = gather_dtensor_param_metadata(base_model)
         meta_json = json.dumps(param_meta).encode("utf-8")
-        meta_tensor = torch.from_numpy(np.frombuffer(meta_json, dtype=np.uint8))
+        # Create writable tensor from bytes (copy to avoid read-only buffer warning)
+        meta_tensor = torch.tensor(np.frombuffer(meta_json, dtype=np.uint8).copy(), dtype=torch.uint8)
         size_tensor = torch.tensor([meta_tensor.numel()], dtype=torch.int32)
+        if use_cuda_tensors:
+            meta_tensor = meta_tensor.cuda(local_gpu)
+            size_tensor = size_tensor.cuda(local_gpu)
         dist.send(size_tensor, dst=0)
         dist.send(meta_tensor, dst=0)
-        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.item()} bytes)")
+        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.cpu().item() if use_cuda_tensors else size_tensor.item()} bytes)")
 
-        recv_model(ep, conn_id, base_model, rank)
+        # Receive routing table from broadcaster
+        logging.info("Waiting for routing table from broadcaster...")
+        routing_size_tensor = torch.zeros(1, dtype=torch.int32)
+        if use_cuda_tensors:
+            routing_size_tensor = routing_size_tensor.cuda(local_gpu)
+        dist.recv(routing_size_tensor, src=0)
+        routing_size = int(routing_size_tensor.cpu().item() if use_cuda_tensors else routing_size_tensor.item())
+        routing_buf = torch.empty(routing_size, dtype=torch.uint8)
+        if use_cuda_tensors:
+            routing_buf = routing_buf.cuda(local_gpu)
+        dist.recv(routing_buf, src=0)
+        if use_cuda_tensors:
+            routing_buf = routing_buf.cpu()
+        routing_table_json = routing_buf.numpy().tobytes().decode("utf-8")
+        routing_table = json.loads(routing_table_json)
+        logging.info("Received routing table from broadcaster.")
+        # Store routing table and connection info for later weight transfer
+        # TODO: Use routing_table and conn_id to send weights to inference after training
 
+        # Model already loaded - no need to receive initial weights
         # Wrap model with FSDP for distributed training across all trainer GPUs
         logging.info(f"Wrapping model with FSDP across {num_trainers} training GPUs...")
         auto_wrap_policy = transformer_auto_wrap_policy(
@@ -945,7 +1016,7 @@ def main():
         logging.info("Model and tokenizer loaded")
         # Convert model parameters to Dtensors
         for name, param in model.named_parameters():
-            param.data = DTensor(param.data, device_mesh, [Replicate()])
+            param.data = DTensor.from_local(param.data, device_mesh, [Replicate()])
 
         # STEP 1: Analyze DTensor layout for sample parameters
         logging.info("="*80)
@@ -997,13 +1068,40 @@ def main():
         # Gather and send parameter metadata to broadcaster
         param_meta = gather_dtensor_param_metadata(model)
         meta_json = json.dumps(param_meta).encode("utf-8")
-        meta_tensor = torch.from_numpy(np.frombuffer(meta_json, dtype=np.uint8))
+        # Create writable tensor from bytes (copy to avoid read-only buffer warning)
+        meta_tensor = torch.tensor(np.frombuffer(meta_json, dtype=np.uint8).copy(), dtype=torch.uint8)
         size_tensor = torch.tensor([meta_tensor.numel()], dtype=torch.int32)
+        if use_cuda_tensors:
+            meta_tensor = meta_tensor.cuda(local_gpu)
+            size_tensor = size_tensor.cuda(local_gpu)
         dist.send(size_tensor, dst=0)
         dist.send(meta_tensor, dst=0)
-        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.item()} bytes)")
+        logging.info(f"Sent parameter metadata to broadcaster (size: {size_tensor.cpu().item() if use_cuda_tensors else size_tensor.item()} bytes)")
 
-        recv_model(ep, conn_id, model, rank)
+        # Receive routing table from broadcaster
+        logging.info("Waiting for routing table from broadcaster...")
+        routing_size_tensor = torch.zeros(1, dtype=torch.int32)
+        if use_cuda_tensors:
+            routing_size_tensor = routing_size_tensor.cuda(local_gpu)
+        dist.recv(routing_size_tensor, src=0)
+        routing_size = int(routing_size_tensor.cpu().item() if use_cuda_tensors else routing_size_tensor.item())
+        routing_buf = torch.empty(routing_size, dtype=torch.uint8)
+        if use_cuda_tensors:
+            routing_buf = routing_buf.cuda(local_gpu)
+        dist.recv(routing_buf, src=0)
+        if use_cuda_tensors:
+            routing_buf = routing_buf.cpu()
+        routing_table_json = routing_buf.numpy().tobytes().decode("utf-8")
+        routing_table = json.loads(routing_table_json)
+        logging.info("Received routing table from broadcaster.")
+        # Store routing table and connection info for later weight reception
+        # TODO: Use routing_table and conn_id to receive weights from trainers after they complete training
+        
+        # Model already loaded - no need to receive initial weights
+        # Wait for trained weights from trainers (will be implemented later)
+        logging.info("Inference model ready. Waiting for trained weights from trainers...")
+        # TODO: After trainers complete training, they will send weights directly using routing table
+        # For now, run inference with initial model
         run_inference(model, tokenizer, num_samples=5)
     
     logging.info("Destroying process group...")
