@@ -1,37 +1,40 @@
-# trainer/trainer.py
-import os, time, socket, torch
-import sys
+import os, time, socket, torch, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from utils.wire import send_tensor
 
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "50051"))
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+CTRL_HOST = os.getenv("CTRL_HOST", "127.0.0.1")
+CTRL_PORT = int(os.getenv("CTRL_PORT", "50051"))
+GPU  = int(os.getenv("GPU", "0"))
+#GPU =2
+DEVICE = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
 
-print(f"[trainer] listening on {HOST}:{PORT}, source device={DEVICE}")
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind((HOST, PORT))
-server.listen(1)
+print(f"[trainer] connecting to controller {CTRL_HOST}:{CTRL_PORT}, device={DEVICE}")
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((CTRL_HOST, CTRL_PORT))
+s.sendall(b"ROLE trainer\n")
+print("[trainer] connected to controller")
 
-conn, addr = server.accept()
-print(f"[trainer] rollout connected from {addr}")
+#weights = torch.ones((2048, 2048), device=DEVICE)
+from transformers import GPT2Model
 
-# pretend “weights” that change over time
-weights = torch.ones((1024, 1024), device=DEVICE)
+print("[trainer] loading GPT-2 model on", DEVICE)
+model = GPT2Model.from_pretrained("gpt2").to(DEVICE)
+weights = torch.cat([p.flatten() for p in model.parameters()])  # flatten all params into one big tensor
+print(f"[trainer] total parameters: {weights.numel()}")
 
+step = 0
+t0 = time.time()
 try:
-    step = 0
     while True:
-        weights.add_(0.01)               # mutate in place
-        send_tensor(conn, weights)       # push update
+        weights.add_(0.01)
+        send_tensor(s, weights)
         step += 1
         if step % 10 == 0:
-            print(f"[trainer] step {step}, sum={weights.sum().item():.2f}")
-        time.sleep(0.5)                  # throttle a bit
+            dt = time.time() - t0
+            print(f"[trainer] step={step:04d} sum={weights.sum().item():.2f} rate={step/dt:.1f} upd/s")
+        time.sleep(0.2)
 except (BrokenPipeError, KeyboardInterrupt):
     print("[trainer] done")
 finally:
-    conn.close()
-    server.close()
+    s.close()
 
