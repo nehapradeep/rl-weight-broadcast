@@ -17,7 +17,7 @@ from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from datasets import load_dataset
 
-# --- DDP Import (Replaces FSDP) ---
+# --- DDP Import ---
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # --- SUPPRESS WARNINGS ---
@@ -35,7 +35,7 @@ TRAIN_WORLD_SIZE = TRAIN_NODES * GPUS_PER_NODE
 INFERENCE_MASTER_RANK = TRAIN_WORLD_SIZE 
 
 # -----------------------------------------------------------
-# Logging Setup
+# Logging Setup (Fixed Flushing)
 # -----------------------------------------------------------
 def setup_logging(rank: int) -> str:
     log_dir = "logs"
@@ -45,15 +45,25 @@ def setup_logging(rank: int) -> str:
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO) 
+    
+    # Clear existing handlers
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
+    # File Handler
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
+    
+    # Console Handler with Force Flush
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
+    
+    # Custom Formatter
     formatter = logging.Formatter(fmt="%(asctime)s | Rank %(rank)d | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
 
+    # Rank Filter
     class RankFilter(logging.Filter):
         def filter(self, record):
             record.rank = rank
@@ -61,17 +71,17 @@ def setup_logging(rank: int) -> str:
 
     fh.addFilter(RankFilter())
     ch.addFilter(RankFilter())
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
+    
     logger.addHandler(fh)
     logger.addHandler(ch)
     return log_file
 
 # -----------------------------------------------------------
-# Dataset (WikiText-2 used as Prompts)
+# Dataset
 # -----------------------------------------------------------
 def get_wikitext_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 128):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # Only log on rank 0 to avoid spam, unless error
     if local_rank != 0:
         import datasets
         datasets.logging.set_verbosity_error()
@@ -101,46 +111,61 @@ def get_wikitext_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 128):
     return WikiTextDataset(data_tensor, seq_len)
 
 # -----------------------------------------------------------
-# Broadcast Helper (Using Standard PyTorch dist)
+# Broadcast Helper (Standard PyTorch TCP/NCCL)
 # -----------------------------------------------------------
 def broadcast_model_to_inference(model, rank, bridge_group, is_sender=False):
+    """
+    Sends model weights using standard torch.distributed.broadcast.
+    This works over whatever backend the bridge_group uses (likely Gloo or NCCL).
+    """
     if bridge_group is None: return
 
     try:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         device = torch.device("cuda", local_rank)
-    except: device = torch.device("cuda")
+    except: 
+        device = torch.device("cuda")
 
-    if is_sender: logging.info("Broadcasting RL weights to Inference Node (Standard Dist)...")
-    
+    if is_sender: 
+        logging.info("Broadcasting weights to Inference Node...")
+    else:
+        logging.info("Waiting for weights from Training Node...")
+        # Force flush to ensure log appears before blocking operation
+        sys.stdout.flush()
+
     t0 = time.time()
+    
+    # We iterate over parameters to ensure robust transfer
     with torch.no_grad():
         for param in model.parameters():
+            # Ensure tensor is on GPU for NCCL broadcast (if using NCCL backend)
+            # Or ensure consistent device for Gloo.
             if param.device.type == "cpu":
                 gpu_param = param.data.to(device)
                 dist.broadcast(gpu_param, src=0, group=bridge_group)
+                # If receiver, move back to CPU if model requires it (rare)
             else:
                 dist.broadcast(param.data, src=0, group=bridge_group)
     
     if is_sender:
         duration = time.time() - t0
-        logging.info(f"Broadcast complete. Time taken: {duration:.2f}s")
+        logging.info(f"Broadcast complete. Time: {duration:.2f}s")
     else:
-        logging.info("RL Weights received from Training Cluster.")
+        logging.info("Weights received.")
+        sys.stdout.flush()
 
 # -----------------------------------------------------------
-# Simple Reward Function
+# Reward Function
 # -----------------------------------------------------------
 def compute_reward(token_ids, tokenizer):
-    # Token ID for "the"
-    target_id = 262 
+    target_id = 262 # "the"
     matches = (token_ids == target_id).float()
     rewards = matches.sum(dim=1) 
     rewards = (rewards * 0.5) - 0.5
     return rewards
 
 # -----------------------------------------------------------
-# RL Trainer Loop (DDP)
+# Trainer Loop (DDP)
 # -----------------------------------------------------------
 def run_trainer(rank, world_size, train_group, bridge_group):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -153,7 +178,7 @@ def run_trainer(rank, world_size, train_group, bridge_group):
     logging.info("Initializing DDP Actor Model...")
     model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
     
-    # --- DDP WRAP (Replaces FSDP) ---
+    # --- DDP WRAPPER ---
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, process_group=train_group)
     
     dataset = get_wikitext_dataset(tokenizer, seq_len=128)
@@ -164,16 +189,17 @@ def run_trainer(rank, world_size, train_group, bridge_group):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5) 
 
     num_epochs = 2
-    total_training_start = time.time()
     
     for epoch in range(1, num_epochs + 1):
         model.train()
         sampler.set_epoch(epoch)
+        epoch_start = time.time()
         total_reward = 0.0
         
-        epoch_start = time.time()
-        
         for i, batch_ids in enumerate(dataloader):
+            # Debug limit
+            # if i > 50: break 
+            
             batch_ids = batch_ids.to(device)
             optimizer.zero_grad()
             
@@ -182,7 +208,6 @@ def run_trainer(rank, world_size, train_group, bridge_group):
             
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = batch_ids[..., 1:].contiguous()
-            
             loss_fct = nn.CrossEntropyLoss(reduction='none')
             neg_log_probs = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             neg_log_probs = neg_log_probs.view(shift_labels.size())
@@ -200,26 +225,18 @@ def run_trainer(rank, world_size, train_group, bridge_group):
                  logging.info(f"Batch {i}/{len(dataloader)} | RL Loss: {rl_loss.item():.4f} | Avg Reward: {rewards.mean().item():.2f}")
 
         epoch_duration = time.time() - epoch_start
-        total_tokens_processed = len(dataloader) * BATCH_SIZE * 128 * dist.get_world_size(group=train_group)
-        throughput = total_tokens_processed / epoch_duration
-
         if rank == 0:
             avg_reward = total_reward / (i+1)
             logging.info(f"--- RL EPOCH {epoch} STATS ---")
             logging.info(f"Duration: {epoch_duration:.2f} seconds")
-            logging.info(f"Throughput: {throughput:.2f} tokens/sec")
             logging.info(f"Avg Reward: {avg_reward:.4f}")
             logging.info(f"-------------------------")
+            sys.stdout.flush()
             
         # --- BRIDGE SYNC ---
-        # With DDP, Rank 0 holds the full model state (no gathering needed)
         if rank == 0:
-            # We access .module because DDP wraps the model
+            # DDP wraps model in .module
             broadcast_model_to_inference(model.module, rank, bridge_group, is_sender=True)
-
-    total_training_time = time.time() - total_training_start
-    if rank == 0:
-        logging.info(f"Total Session Time: {total_training_time:.2f} seconds")
 
 # -----------------------------------------------------------
 # Inference Loop
@@ -239,6 +256,9 @@ def run_inference(rank, bridge_group):
     num_epochs = 2 
     for epoch in range(1, num_epochs + 1):
         logging.info(f"Waiting for RL model update (Epoch {epoch})...")
+        sys.stdout.flush()
+        
+        # This will block until Rank 0 calls broadcast
         broadcast_model_to_inference(model, rank, bridge_group, is_sender=False)
         
         logging.info("Running inference test...")
@@ -257,11 +277,16 @@ def run_inference(rank, bridge_group):
         generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
         logging.info(f"--- [INFERENCE RESULT EPOCH {epoch}] ---")
         logging.info(f"Output: {generated_text}")
+        logging.info("---------------------------------------")
+        sys.stdout.flush()
 
 # -----------------------------------------------------------
 # Main
 # -----------------------------------------------------------
 def main():
+    # Use NCCL everywhere for simplicity if hardware supports it, 
+    # but GLOO is safer for the bridge group if network config is tricky.
+    # Here we use NCCL globally for performance.
     dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=60))
     rank = dist.get_rank()
     log_file = setup_logging(rank)
@@ -271,7 +296,9 @@ def main():
 
     train_ranks = list(range(0, TRAIN_WORLD_SIZE))
     train_group = dist.new_group(ranks=train_ranks)
+    
     bridge_ranks = [0, INFERENCE_MASTER_RANK]
+    # Use NCCL for bridge too so we use RDMA/Broadcoms
     bridge_group = dist.new_group(ranks=bridge_ranks)
 
     if rank in train_ranks:
@@ -280,6 +307,7 @@ def main():
     elif rank == INFERENCE_MASTER_RANK:
         run_inference(rank, bridge_group)
     else:
+        logging.info("Idling...")
         pass
 
     logging.info("Waiting for all ranks to complete...")

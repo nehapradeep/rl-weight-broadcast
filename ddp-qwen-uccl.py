@@ -2,7 +2,9 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 import logging
+import socket
 import functools
 import itertools
 from datetime import datetime, timedelta
@@ -11,9 +13,11 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+
+# --- DDP Import ---
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # UCCL Import
 try:
@@ -27,9 +31,6 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "OFF"
-
-# DDP Import
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------
 # Configuration
@@ -50,14 +51,19 @@ def setup_logging(rank: int) -> str:
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO) 
+    
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
+    
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
+    
     formatter = logging.Formatter(fmt="%(asctime)s | Rank %(rank)d | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
 
     class RankFilter(logging.Filter):
         def filter(self, record):
@@ -66,8 +72,7 @@ def setup_logging(rank: int) -> str:
 
     fh.addFilter(RankFilter())
     ch.addFilter(RankFilter())
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
+    
     logger.addHandler(fh)
     logger.addHandler(ch)
     return log_file
@@ -75,7 +80,7 @@ def setup_logging(rank: int) -> str:
 # -----------------------------------------------------------
 # Dataset
 # -----------------------------------------------------------
-def get_wikitext_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 128):
+def get_wikitext_dataset(tokenizer: AutoTokenizer, seq_len: int = 128):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if local_rank != 0:
         import datasets
@@ -106,16 +111,17 @@ def get_wikitext_dataset(tokenizer: GPT2Tokenizer, seq_len: int = 128):
     return WikiTextDataset(data_tensor, seq_len)
 
 # -----------------------------------------------------------
-# UCCL Collective Broadcast Helper
+# UCCL Collective Broadcast Helper (RDMA)
 # -----------------------------------------------------------
 def broadcast_model_uccl(model, rank, is_sender=False):
     """
-    Uses uccl.collective to send/recv model weights.
+    Uses uccl.collective to send/recv model weights via RDMA.
     Rank 0 sends to Rank 16.
     """
     SRC_RANK = 0
     DST_RANK = INFERENCE_MASTER_RANK
 
+    # Only participate if sender or receiver
     if rank != SRC_RANK and rank != DST_RANK:
         return
 
@@ -129,8 +135,9 @@ def broadcast_model_uccl(model, rank, is_sender=False):
         logging.info("UCCL: Starting Broadcast (Sender)...")
     else:
         logging.info("UCCL: Waiting for Broadcast (Receiver)...")
+        sys.stdout.flush()
 
-    # Access state dict depending on if it's DDP wrapped or standard
+    # DDP Handling: Access .module state dict if wrapped
     if isinstance(model, DDP):
         state_dict = model.module.state_dict()
     else:
@@ -142,17 +149,17 @@ def broadcast_model_uccl(model, rank, is_sender=False):
     t0 = time.perf_counter()
 
     for name, tensor in items:
-        # 1. Move to GPU if needed
+        # 1. Move to GPU if needed (UCCL RDMA requirement)
         if not tensor.is_cuda:
             tensor_gpu = tensor.cuda(device, non_blocking=True)
         else:
             tensor_gpu = tensor
 
-        # 2. Ensure contiguous
+        # 2. Ensure contiguous memory layout
         if not tensor_gpu.is_contiguous():
             tensor_gpu = tensor_gpu.contiguous()
 
-        # 3. Register (Pin)
+        # 3. Register (Pin) memory for zero-copy RDMA
         collective.register_tensor(tensor_gpu)
 
         if is_sender:
@@ -160,43 +167,50 @@ def broadcast_model_uccl(model, rank, is_sender=False):
         else:
             collective.recv(tensor_gpu, src=SRC_RANK)
             
-            # Copy back logic
+            # Copy back logic for receiver
             if not tensor.is_cuda:
                 tensor.copy_(tensor_gpu.cpu())
             elif tensor.data_ptr() != tensor_gpu.data_ptr():
                 tensor.copy_(tensor_gpu)
 
     duration = time.perf_counter() - t0
-    bw = (total_bytes / 1e9) / duration
+    bw = (total_bytes / 1e9) / duration if duration > 0 else 0
     
     if is_sender:
-        logging.info(f"UCCL Broadcast Complete. Time: {duration:.3f}s | BW: {bw:.2f} GB/s")
+        logging.info(f"UCCL Broadcast Complete. Time: {duration:.4f}s | BW: {bw:.2f} GB/s")
     else:
-        logging.info(f"UCCL Receive Complete. Updated Model.")
+        logging.info(f"UCCL Receive Complete. Updated Model. Time: {duration:.4f}s")
+        sys.stdout.flush()
 
 # -----------------------------------------------------------
-# RL Trainer Loop
+# Reward Function
 # -----------------------------------------------------------
 def compute_reward(token_ids, tokenizer):
-    target_id = 262 # "the"
+    # Dynamic "the" finding for Qwen
+    target_id = tokenizer.encode("the", add_special_tokens=False)[0] 
+    
     matches = (token_ids == target_id).float()
     rewards = matches.sum(dim=1) 
     rewards = (rewards * 0.5) - 0.5
     return rewards
 
+# -----------------------------------------------------------
+# Trainer Loop (DDP)
+# -----------------------------------------------------------
 def run_trainer(rank, world_size, train_group):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    logging.info("Initializing DDP Actor Model (Qwen2.5-0.5B)...")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B").to(device)
     
-    logging.info("Initializing DDP Actor Model...")
-    model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
-    
-    # --- DDP WRAP ---
-    # DDP replicates the model on every GPU.
+    # --- DDP WRAPPER ---
+    # We pass the NCCL train_group to ensure fast gradient sync
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, process_group=train_group)
     
     dataset = get_wikitext_dataset(tokenizer, seq_len=128)
@@ -207,16 +221,17 @@ def run_trainer(rank, world_size, train_group):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5) 
 
     num_epochs = 2
-    total_training_start = time.time()
     
     for epoch in range(1, num_epochs + 1):
         model.train()
         sampler.set_epoch(epoch)
-        total_reward = 0.0
         epoch_start = time.time()
+        total_reward = 0.0
         
         for i, batch_ids in enumerate(dataloader):
-            if i > 40: break
+            # Debug limit
+            if i > 50: break 
+            
             batch_ids = batch_ids.to(device)
             optimizer.zero_grad()
             
@@ -242,27 +257,19 @@ def run_trainer(rank, world_size, train_group):
                  logging.info(f"Batch {i}/{len(dataloader)} | RL Loss: {rl_loss.item():.4f} | Avg Reward: {rewards.mean().item():.2f}")
 
         epoch_duration = time.time() - epoch_start
-        total_tokens_processed = len(dataloader) * BATCH_SIZE * 128 * dist.get_world_size(group=train_group)
-        throughput = total_tokens_processed / epoch_duration
-
         if rank == 0:
-            avg_reward = total_reward / len(dataloader)
+            avg_reward = total_reward / (i+1)
             logging.info(f"--- RL EPOCH {epoch} STATS ---")
             logging.info(f"Duration: {epoch_duration:.2f} seconds")
-            logging.info(f"Throughput: {throughput:.2f} tokens/sec")
             logging.info(f"Avg Reward: {avg_reward:.4f}")
             logging.info(f"-------------------------")
+            sys.stdout.flush()
             
-        # --- BRIDGE SYNC (UCCL Collective) ---
+        # --- BRIDGE SYNC (UCCL) ---
         if rank == 0:
-            logging.info("Preparing weights for UCCL broadcast from DDP Master...")
-            # In DDP, Rank 0 already has the full model in model.module
-            # No gathering required!
+            logging.info("Broadcasting weights via UCCL RDMA...")
+            # DDP wraps model in .module
             broadcast_model_uccl(model, rank, is_sender=True)
-
-    total_training_time = time.time() - total_training_start
-    if rank == 0:
-        logging.info(f"Total Session Time: {total_training_time:.2f} seconds")
 
 # -----------------------------------------------------------
 # Inference Loop
@@ -272,16 +279,18 @@ def run_inference(rank):
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    logging.info("Initializing Inference Model...")
-    model = GPT2LMHeadModel.from_pretrained("gpt2").to(device)
+    logging.info("Initializing Inference Model (Qwen2.5-0.5B)...")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B").to(device)
     model.eval()
     
     num_epochs = 2 
     for epoch in range(1, num_epochs + 1):
         logging.info(f"Waiting for UCCL model update (Epoch {epoch})...")
+        sys.stdout.flush()
         
         # Receive via UCCL Collective
         broadcast_model_uccl(model, rank, is_sender=False)
@@ -302,15 +311,18 @@ def run_inference(rank):
         generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
         logging.info(f"--- [INFERENCE RESULT EPOCH {epoch}] ---")
         logging.info(f"Output: {generated_text}")
+        logging.info("---------------------------------------")
+        sys.stdout.flush()
 
 # -----------------------------------------------------------
 # Main
 # -----------------------------------------------------------
 def main():
+    # Sync Interfaces: Copy NCCL to GLOO if needed
     if "NCCL_SOCKET_IFNAME" in os.environ and "GLOO_SOCKET_IFNAME" not in os.environ:
         os.environ["GLOO_SOCKET_IFNAME"] = os.environ["NCCL_SOCKET_IFNAME"]
 
-    # 1. Init GLOO for UCCL
+    # 1. Init GLOO (Required for UCCL Control Plane)
     dist.init_process_group(backend="gloo", init_method="env://", timeout=timedelta(minutes=60))
     rank = dist.get_rank()
     log_file = setup_logging(rank)
@@ -318,11 +330,12 @@ def main():
     if rank == 0:
         logging.info(f"NCCL_SOCKET_IFNAME: {os.environ.get('NCCL_SOCKET_IFNAME', 'Not Set')}")
 
-    # 2. Init UCCL
+    # 2. Init UCCL (RDMA Data Plane)
     logging.info("Initializing UCCL Collective...")
     collective.init_collective(num_cpus=4)
     
-    # 3. Setup NCCL Group for DDP
+    # 3. Setup NCCL Group (Fast Training Plane)
+    # We must create a separate NCCL group for DDP to avoid using the slow GLOO backend for gradients
     train_ranks = list(range(0, TRAIN_WORLD_SIZE))
     train_group = dist.new_group(ranks=train_ranks, backend="nccl")
     
