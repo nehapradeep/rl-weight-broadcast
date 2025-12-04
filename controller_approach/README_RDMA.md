@@ -144,7 +144,7 @@ torchrun --nproc_per_node=8 \
          --nnodes=4 \
          --node_rank=0 \
          --master_addr=$MASTER_ADDR \
-         --master_port=29500 \
+         --master_port=29501 \
          main_distributed_rdma.py
 ```
 
@@ -154,7 +154,7 @@ torchrun --nproc_per_node=8 \
          --nnodes=4 \
          --node_rank=1 \
          --master_addr=$MASTER_ADDR \
-         --master_port=29500 \
+         --master_port=29501 \
          main_distributed_rdma.py
 ```
 
@@ -164,7 +164,7 @@ torchrun --nproc_per_node=8 \
          --nnodes=4 \
          --node_rank=2 \
          --master_addr=$MASTER_ADDR \
-         --master_port=29500 \
+         --master_port=29501 \
          main_distributed_rdma.py
 ```
 
@@ -174,7 +174,7 @@ torchrun --nproc_per_node=8 \
          --nnodes=4 \
          --node_rank=3 \
          --master_addr=$MASTER_ADDR \
-         --master_port=29500 \
+         --master_port=29501 \
          main_distributed_rdma.py
 ```
 

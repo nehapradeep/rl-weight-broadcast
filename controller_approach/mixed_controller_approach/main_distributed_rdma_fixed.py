@@ -1,6 +1,10 @@
 """
 Main Distributed Training Script with RDMA Weight Transfers - FIXED
-Uses UCCL P2P with proper synchronization and 24 training ranks
+Uses UCCL P2P with GLOO-style metadata exchange (like benchmark_uccl.py)
+
+KEY FIX: 
+- Uses GLOO backend for metadata exchange (CPU tensors, like benchmark_uccl.py)
+- Uses NCCL for DDP gradient sync
 
 Setup for 4 nodes × 8 AMD GPUs:
 - Node 0 (ranks 0-7): Training (rank 0 also runs controller)
@@ -30,17 +34,19 @@ import argparse
 import logging
 from datetime import datetime
 import pickle
+import time
 
+# Global process groups
 TRAIN_RANKS = None
-TRAIN_GROUP = None
-METADATA_GROUP = None  # NEW: Subgroup for metadata exchange
+TRAIN_GROUP = None   # NCCL group for DDP
+GLOO_GROUP = None    # GLOO group for metadata exchange (like benchmark_uccl.py)
 
 from weight_transfer_controller import (
     WeightTransferController,
     simulate_parameter_distribution
 )
-from training_worker_rdma import OptimizedRDMATrainingWorker
-from inference_worker_rdma import RDMAInferenceWorker
+from training_worker_rdma_fixed import OptimizedRDMATrainingWorker
+from inference_worker_rdma_fixed import RDMAInferenceWorker
 
 
 def setup_logging(rank: int):
@@ -73,14 +79,18 @@ def setup_logging(rank: int):
 
 
 def setup_distributed():
-    """Initialize distributed environment with subgroups"""
-    global TRAIN_RANKS, TRAIN_GROUP, METADATA_GROUP
+    """
+    Initialize distributed environment with:
+    - NCCL backend for DDP (GPU gradient sync)
+    - GLOO backend for metadata exchange (CPU tensors, like benchmark_uccl.py)
+    """
+    global TRAIN_RANKS, TRAIN_GROUP, GLOO_GROUP
 
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    # Initialize NCCL for all ranks
+    # Initialize NCCL as default backend (for DDP gradient sync)
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
@@ -90,28 +100,23 @@ def setup_distributed():
 
     torch.cuda.set_device(local_rank)
 
-    # ===== TRAINING SUBGROUP: Ranks 0-23 (24 GPUs) =====
+    # ===== TRAINING SUBGROUP (NCCL): Ranks 0-23 for DDP gradient sync =====
     TRAIN_RANKS = list(range(0, 24))
-    pg_train = dist.new_group(ranks=TRAIN_RANKS)
+    pg_train = dist.new_group(ranks=TRAIN_RANKS, backend="nccl")
 
     if rank in TRAIN_RANKS:
         TRAIN_GROUP = pg_train
-        logging.info(f"[Rank {rank}] Joined TRAIN_GROUP with 24 ranks")
+        logging.info(f"[Rank {rank}] Joined TRAIN_GROUP (NCCL) with 24 ranks")
     else:
         TRAIN_GROUP = None
 
-    # ===== METADATA SUBGROUP: Training (0-23) + Inference (24-31) =====
-    # This is CRITICAL for metadata exchange!
-    metadata_ranks = list(range(0, 24)) + list(range(24, 32))  # 32 total ranks
-    pg_metadata = dist.new_group(ranks=metadata_ranks)
-    
-    if rank in metadata_ranks:
-        METADATA_GROUP = pg_metadata
-        logging.info(f"[Rank {rank}] Joined METADATA_GROUP with {len(metadata_ranks)} ranks")
-    else:
-        METADATA_GROUP = None
+    # ===== GLOO GROUP: For metadata exchange (CPU tensors) =====
+    # This is the KEY FIX - benchmark_uccl.py uses GLOO for metadata exchange
+    # NCCL doesn't support CPU tensors, so metadata exchange was failing
+    GLOO_GROUP = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    logging.info(f"[Rank {rank}] Created GLOO_GROUP for metadata exchange (like benchmark_uccl.py)")
 
-    logging.info(f"[Rank {rank}] Using backend: {dist.get_backend()}")
+    logging.info(f"[Rank {rank}] Distributed setup: NCCL for DDP, GLOO for metadata")
 
     return rank, local_rank, world_size
 
@@ -130,12 +135,12 @@ def prepare_model_and_data(rank: int, local_rank: int, world_size: int):
 
     role = get_role(rank, world_size)
 
-    # Wrap with DDP for training ranks
+    # Wrap with DDP for training ranks (uses NCCL)
     if role == "training":
         if TRAIN_GROUP is None or TRAIN_RANKS is None:
             raise RuntimeError(f"[Rank {rank}] TRAIN_GROUP not initialized")
 
-        logging.info(f"[Rank {rank}] Wrapping model with DDP using TRAIN_GROUP")
+        logging.info(f"[Rank {rank}] Wrapping model with DDP using TRAIN_GROUP (NCCL)")
 
         model = DDP(
             model,
@@ -176,7 +181,7 @@ def prepare_model_and_data(rank: int, local_rank: int, world_size: int):
     )
 
     if role == "training":
-        train_world_size = len(TRAIN_RANKS)  # 24
+        train_world_size = len(TRAIN_RANKS)
         train_rank = TRAIN_RANKS.index(rank)
 
         logging.info(f"[Rank {rank}] TRAIN subgroup rank={train_rank}/{train_world_size}")
@@ -205,13 +210,7 @@ def cleanup_distributed():
 
 
 def get_role(rank: int, world_size: int):
-    """
-    Determine the role of this rank
-    
-    Setup:
-    - Ranks 0-23: Training (nodes 0-2)
-    - Ranks 24-31: Inference (node 3)
-    """
+    """Determine the role of this rank"""
     if rank < 24:
         return "training"
     elif 24 <= rank < 32:
@@ -221,39 +220,31 @@ def get_role(rank: int, world_size: int):
 
 
 def run_controller(rank: int, world_size: int, model: torch.nn.Module):
-    """
-    Controller logic (runs on rank 0 while also training)
-    Computes routing tables for weight distribution
-    """
+    """Controller logic (runs on rank 0)"""
     logging.info(f"\n{'='*60}")
     logging.info(f"[Rank {rank}] CONTROLLER: Computing routing tables")
     logging.info(f"{'='*60}\n")
     
-    # Define ranks
-    training_ranks = list(range(0, 24))  # 24 training GPUs
-    inference_ranks = list(range(24, 32))  # 8 inference GPUs
+    training_ranks = list(range(0, 24))
+    inference_ranks = list(range(24, 32))
     
     logging.info(f"[Rank {rank}] Training ranks: {training_ranks}")
     logging.info(f"[Rank {rank}] Inference ranks: {inference_ranks}")
     
-    # Simulate parameter distribution
     trainer_params, inference_params = simulate_parameter_distribution(
         model, training_ranks, inference_ranks, use_data_parallel=True
     )
     
-    # Create controller
     controller = WeightTransferController(
         training_ranks=training_ranks,
         inference_ranks=inference_ranks,
         world_size=world_size
     )
     
-    # Compute routing tables
     routing_tables = controller.compute_routing_tables(
         trainer_params, inference_params
     )
     
-    # Print detailed routing
     controller.print_routing_details(routing_tables)
     
     logging.info(f"\n[Rank {rank}] Controller computation complete")
@@ -262,60 +253,41 @@ def run_controller(rank: int, world_size: int, model: torch.nn.Module):
 
 
 def broadcast_routing_table(routing_tables: dict, rank: int, training_ranks: list):
-    """
-    Broadcast routing tables from rank 0 to all training ranks
-    
-    Args:
-        routing_tables: Dict of routing tables from controller (only on rank 0)
-        rank: Current rank
-        training_ranks: List of all training ranks
-    
-    Returns:
-        This rank's routing table
-    """
+    """Broadcast routing tables from rank 0 to all training ranks"""
     if rank == 0:
-        # Rank 0 has the routing tables, broadcast to others
-        logging.info(f"[Rank {rank}] Broadcasting routing tables to all training ranks...")
+        logging.info(f"[Rank {rank}] Broadcasting routing tables to training ranks...")
         
         for target_rank in training_ranks:
             if target_rank == 0:
-                continue  # Skip self
+                continue
             
-            # Serialize routing table for this rank
             routing_table = routing_tables.get(target_rank, None)
             data = pickle.dumps(routing_table)
             
-            # Send size first
             size_tensor = torch.tensor([len(data)], dtype=torch.int64).cuda()
             dist.send(size_tensor, dst=target_rank)
             
-            # Send data
             data_tensor = torch.ByteTensor(list(data)).cuda()
             dist.send(data_tensor, dst=target_rank)
             
             logging.info(f"[Rank {rank}] Sent routing table to rank {target_rank}")
         
-        # Return rank 0's own routing table
         return routing_tables.get(0, None)
     
     else:
-        # Other training ranks receive from rank 0
         logging.info(f"[Rank {rank}] Receiving routing table from rank 0...")
         
-        # Receive size
         size_tensor = torch.zeros(1, dtype=torch.int64).cuda()
         dist.recv(size_tensor, src=0)
         data_size = size_tensor.item()
         
-        # Receive data
         data_tensor = torch.zeros(data_size, dtype=torch.uint8).cuda()
         dist.recv(data_tensor, src=0)
         
-        # Deserialize
         data = bytes(data_tensor.cpu().tolist())
         routing_table = pickle.loads(data)
         
-        logging.info(f"[Rank {rank}] Received routing table with {len(routing_table.transfers) if routing_table else 0} transfers")
+        logging.info(f"[Rank {rank}] Received routing table")
         
         return routing_table
 
@@ -330,12 +302,12 @@ def run_training_rdma(
     num_epochs: int = 1
 ):
     """Run training loop with RDMA weight updates"""
-    global METADATA_GROUP
+    global GLOO_GROUP
     
     logging.info(f"[CHECKPOINT T1] Rank {rank} - ENTERED run_training_rdma")
     
     logging.info(f"\n{'='*60}")
-    logging.info(f"[Rank {rank}] TRAINING with RDMA")
+    logging.info(f"[Rank {rank}] TRAINING with RDMA (using GLOO for metadata)")
     logging.info(f"{'='*60}\n")
     
     # Create RDMA training worker
@@ -349,11 +321,6 @@ def run_training_rdma(
     )
     logging.info(f"[CHECKPOINT T3] Rank {rank} - RDMA worker created")
     
-    # CRITICAL: Wait for endpoint to fully initialize
-    import time
-    logging.info(f"[Rank {rank}] Waiting 5s for all endpoints to fully initialize...")
-    time.sleep(5)
-    
     # Set routing table
     if routing_table:
         rdma_worker.set_routing_table(routing_table)
@@ -361,29 +328,32 @@ def run_training_rdma(
     else:
         logging.warning(f"[Rank {rank}] No routing table received!")
     
-    # Exchange metadata with all RDMA ranks (training + inference)
+    # Wait for all endpoints to initialize
+    logging.info(f"[Rank {rank}] Waiting 5s for all endpoints to initialize...")
+    time.sleep(5)
+    
+    # Exchange metadata using GLOO (like benchmark_uccl.py)
     training_ranks = list(range(0, 24))
     inference_ranks = list(range(24, 32))
     all_ranks = training_ranks + inference_ranks
     
-    logging.info(f"[CHECKPOINT T4] Rank {rank} - Starting metadata exchange")
-    all_metadata = rdma_worker.exchange_metadata(all_ranks, metadata_group=METADATA_GROUP)
+    logging.info(f"[CHECKPOINT T4] Rank {rank} - Starting metadata exchange (GLOO)")
+    all_metadata = rdma_worker.exchange_metadata(all_ranks, gloo_group=GLOO_GROUP)
     logging.info(f"[CHECKPOINT T5] Rank {rank} - Metadata exchange complete")
     
     dist.barrier()
     logging.info(f"[CHECKPOINT T6] Rank {rank} - After metadata barrier")
     
-    # PHASE 1: Wait for inference ranks to signal they're ready
-    logging.info(f"[Rank {rank}] Waiting for inference ranks to be ready to accept connections...")
-    dist.barrier()  # This matches the inference barrier - they signal ready here
-    logging.info(f"[Rank {rank}] Inference ranks confirmed ready, proceeding to connect")
+    # Wait for inference ranks to signal ready
+    logging.info(f"[Rank {rank}] Waiting for inference ranks to be ready...")
+    dist.barrier()
+    logging.info(f"[Rank {rank}] Inference ranks ready, proceeding to connect")
     
-    # PHASE 2: Now connect (with staggering to avoid overwhelming)
+    # Setup RDMA connections to inference ranks
     logging.info(f"[CHECKPOINT T7] Rank {rank} - Setting up RDMA connections")
     rdma_worker.setup_connections(inference_ranks, all_metadata)
     logging.info(f"[CHECKPOINT T8] Rank {rank} - RDMA connections established")
     
-    # PHASE 3: Wait for ALL ranks to complete connection setup
     dist.barrier()
     logging.info(f"[CHECKPOINT T9] Rank {rank} - All ranks completed connection setup")
     
@@ -421,11 +391,10 @@ def run_training_rdma(
             if step % 10 == 0:
                 logging.info(f"[Rank {rank}] Step {global_step}, Loss: {loss.item():.4f}")
             
-            # Periodic RDMA weight update (every 100 steps)
+            # Periodic RDMA weight update
             if global_step % 100 == 0:
                 logging.info(f"\n[Rank {rank}] === RDMA WEIGHT UPDATE at step {global_step} ===")
                 
-                # Synchronize all training ranks before weight transfer
                 torch.cuda.synchronize()
                 dist.barrier(group=TRAIN_GROUP)
                 
@@ -436,7 +405,6 @@ def run_training_rdma(
                 except Exception as e:
                     logging.error(f"[Rank {rank}] RDMA failed: {e}", exc_info=True)
                 
-                # Synchronize after transfer
                 torch.cuda.synchronize()
                 dist.barrier(group=TRAIN_GROUP)
                 logging.info(f"[Rank {rank}] === RDMA WEIGHT UPDATE COMPLETE ===\n")
@@ -458,12 +426,12 @@ def run_inference_rdma(
     tokenizer
 ):
     """Run inference loop with RDMA weight updates"""
-    global METADATA_GROUP
+    global GLOO_GROUP
     
     logging.info(f"[CHECKPOINT I1] Rank {rank} - ENTERED run_inference_rdma")
     
     logging.info(f"\n{'='*60}")
-    logging.info(f"[Rank {rank}] INFERENCE with RDMA")
+    logging.info(f"[Rank {rank}] INFERENCE with RDMA (using GLOO for metadata)")
     logging.info(f"{'='*60}\n")
     
     training_ranks = list(range(0, 24))
@@ -476,43 +444,37 @@ def run_inference_rdma(
         local_rank=local_rank,
         world_size=world_size,
         training_ranks=training_ranks,
-        num_max_connections=24  # Can receive from up to 24 training ranks
+        num_max_connections=24
     )
     logging.info(f"[CHECKPOINT I3] Rank {rank} - RDMA worker created")
     
-    # CRITICAL: Wait for endpoint to fully initialize
-    import time
-    logging.info(f"[Rank {rank}] Waiting 5s for all endpoints to fully initialize...")
+    # Wait for all endpoints to initialize
+    logging.info(f"[Rank {rank}] Waiting 5s for all endpoints to initialize...")
     time.sleep(5)
     
-    # Exchange metadata
+    # Exchange metadata using GLOO (like benchmark_uccl.py)
     inference_ranks = list(range(24, 32))
     all_ranks = training_ranks + inference_ranks
     
-    logging.info(f"[CHECKPOINT I4] Rank {rank} - Starting metadata exchange")
-    all_metadata = rdma_worker.exchange_metadata(all_ranks, metadata_group=METADATA_GROUP)
+    logging.info(f"[CHECKPOINT I4] Rank {rank} - Starting metadata exchange (GLOO)")
+    all_metadata = rdma_worker.exchange_metadata(all_ranks, gloo_group=GLOO_GROUP)
     logging.info(f"[CHECKPOINT I5] Rank {rank} - Metadata exchange complete")
     
     dist.barrier()
     logging.info(f"[CHECKPOINT I6] Rank {rank} - After metadata barrier")
     
-    # PHASE 1: Inference ranks prepare to accept connections
-    logging.info(f"[CHECKPOINT I7] Rank {rank} - Inference rank preparing to accept RDMA connections")
-    # The endpoint is already listening, just need to signal we're ready
-    
-    # PHASE 2: Signal to ALL ranks that inference is ready
-    logging.info(f"[Rank {rank}] Signaling that inference rank is READY to accept connections")
-    dist.barrier()  # All ranks sync here - inference ready, training waiting
-    logging.info(f"[Rank {rank}] All ranks synchronized - inference ranks are ready")
-    
-    # PHASE 3: Now accept connections from training ranks
-    logging.info(f"[CHECKPOINT I8] Rank {rank} - Now accepting {len(training_ranks)} RDMA connections...")
-    rdma_worker.setup_connections(training_ranks=training_ranks)
-    logging.info(f"[CHECKPOINT I9] Rank {rank} - All {len(training_ranks)} RDMA connections accepted successfully")
-    
-    # PHASE 4: Wait for all ranks to complete connection setup
+    # Signal to training ranks that we're ready
+    logging.info(f"[Rank {rank}] Signaling ready to accept connections")
     dist.barrier()
-    logging.info(f"[CHECKPOINT I10] Rank {rank} - All ranks completed connection setup")
+    logging.info(f"[Rank {rank}] All ranks synchronized")
+    
+    # Accept connections from training ranks
+    logging.info(f"[CHECKPOINT I7] Rank {rank} - Accepting RDMA connections")
+    rdma_worker.setup_connections(training_ranks=training_ranks)
+    logging.info(f"[CHECKPOINT I8] Rank {rank} - All connections accepted")
+    
+    dist.barrier()
+    logging.info(f"[CHECKPOINT I9] Rank {rank} - All ranks completed connection setup")
     
     # Prepare test prompts
     test_prompts = [
@@ -563,8 +525,6 @@ def run_inference_rdma(
             logging.info(f"[Rank {rank}] Generated: {generated_text[:100]}...")
         
         inference_step += 1
-        
-        import time
         time.sleep(0.1)
     
     logging.info(f"[Rank {rank}] Inference completed")

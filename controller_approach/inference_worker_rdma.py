@@ -48,31 +48,28 @@ class RDMAInferenceWorker:
         
         logging.info(f"[Inference Rank {rank}] UCCL P2P endpoint initialized")
     
-    def exchange_metadata(self, all_ranks: List[int]) -> Dict[int, bytes]:
-        """
-        Exchange P2P metadata with all ranks using torch.distributed
-        
-        Returns:
-            Dict mapping rank -> metadata bytes
-        """
+    def exchange_metadata(self, all_ranks: List[int], metadata_group=None) -> Dict[int, bytes]:
+        """Non-blocking metadata exchange using all_gather"""
         logging.info(f"[Inference Rank {self.rank}] Starting metadata exchange...")
         
-        all_metadata = {}
-        all_metadata[self.rank] = self.local_metadata
+        # Convert metadata to tensor and move to GPU for NCCL
+        device = torch.device(f"cuda:{self.local_rank}")
+        metadata_tensor = torch.ByteTensor(list(self.local_metadata)).to(device)
         
-        # Use torch.distributed for metadata exchange
-        for i in all_ranks:
-            if i == self.rank:
-                # Send my metadata to all others
-                for j in all_ranks:
-                    if j != self.rank:
-                        metadata_tensor = torch.ByteTensor(list(self.local_metadata))
-                        dist.send(metadata_tensor, dst=j)
-            else:
-                # Receive metadata from rank i
-                remote_md = torch.zeros(len(self.local_metadata), dtype=torch.uint8)
-                dist.recv(remote_md, src=i)
-                all_metadata[i] = bytes(remote_md.tolist())
+        # Gather all metadata at once (non-blocking collective)
+        gathered = [torch.zeros_like(metadata_tensor).to(device) for _ in all_ranks]
+        
+        # Use metadata_group if provided, otherwise default group
+        if metadata_group is not None:
+            dist.all_gather(gathered, metadata_tensor, group=metadata_group)
+        else:
+            dist.all_gather(gathered, metadata_tensor)
+        
+        # Convert back to dict (move to CPU for processing)
+        all_metadata = {
+            rank: bytes(tensor.cpu().tolist()) 
+            for rank, tensor in zip(all_ranks, gathered)
+        }
         
         logging.info(f"[Inference Rank {self.rank}] Metadata exchange complete")
         return all_metadata

@@ -22,10 +22,10 @@ class ClusterConfig:
         return self.num_nodes * self.gpus_per_node
     
     # Network interface (for NCCL)
-    network_interface: str = "eth0"  # Change to "ib0" for InfiniBand
+    network_interface: str = "ens26np0"  # Change to "ib0" for InfiniBand
     
     # Master node address
-    master_addr: str = "localhost"  # Change to actual IP in multi-node setup
+    master_addr: str = "45.76.29.254"  # Change to actual IP in multi-node setup
     master_port: int = 29500
 
 
