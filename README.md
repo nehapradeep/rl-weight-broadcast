@@ -90,7 +90,7 @@ Data path: **UCCL RDMA**
                                        ▼
         ┌──────────────────────────────────────────────────────────────┐
         │                        Training Nodes                        │
-        │                  (DDP/FSDP: (8,16,24,32) total GPUs)         │
+        │                          (DDP/FSDP)                          │
         │   ┌────────────────────────────────────────────────────────┐ │
         │   │  - PPO updates                                         │ │
         │   │  - NCCL intra-node gradient AllReduce                  │ │
@@ -100,7 +100,7 @@ Data path: **UCCL RDMA**
                                         │ RDMA (one-sided)
                                         ▼
                 ┌──────────────────────────────────────────────┐
-                │             Inference Nodes (8 GPUs)         │
+                │             Inference Nodes                  │
                 │  - Receive weights via one-sided RDMA        │
                 │  - Perform rollouts                          │
                 └──────────────────────────────────────────────┘
