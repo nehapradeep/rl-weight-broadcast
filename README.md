@@ -125,19 +125,33 @@ Data path: **UCCL RDMA**
 These variables configure both NCCL and UCCL for RDMA-based GPU networking.
 
 ```bash
-export NCCL_SOCKET_IFNAME=enp49s0f1np1
+# --- Networking interfaces (replace with your cluster NIC) ---
+export NCCL_SOCKET_IFNAME="enp49s0f1np1"
+export GLOO_SOCKET_IFNAME="enp49s0f1np1"
+
+# --- NCCL RDMA settings ---
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA="^bnxt_re6"
+export NCCL_IB_GID_INDEX=3
+export NCCL_MIN_NCHANNELS=4      # Improves hybrid NCCL + UCCL performance
+export NCCL_MAX_NCHANNELS=8
 export NCCL_NSOCKS_PERTHREAD=2
 export NCCL_SOCKET_NTHREADS=1
-export NCCL_IB_DISABLE=0
-export NCCL_IB_HCA='^bnxt_re6'
-export NCCL_IB_GID_INDEX=3
-export UCCL_IB_GID_INDEX=3
 export NCCL_DEBUG=INFO
+
+# --- UCCL RDMA settings ---
+export UCCL_IB_GID_INDEX=3
+
+# --- CPU threading (recommended for multi-node runs) ---
+export OMP_NUM_THREADS=1
+
+# --- Set to the IP of node 0 (master node) ---
+export MASTER_ADDR=<MASTER_NODE_IP>
 ```
 
-> **Note:** Replace `enp49s0f1np1` with your cluster-specific NIC interface.
-
----
+> **Note:** Replace `"enp49s0f1np1"` with the NIC interface on your cluster.
+>  
+> The `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` settings significantly speed up our hybrid NCCL + UCCL setup.
 
 
 # Running the System
