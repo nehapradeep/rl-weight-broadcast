@@ -77,9 +77,39 @@ Inference Nodes
 Control path: **Gloo**  
 Data path: **UCCL RDMA**
 
+# Architecture Diagram
+
+```
+                        ┌─────────────────────────────┐
+                        │        Controller Node      │
+                        │  - Gathers metadata         │
+                        │  - Computes routing table   │
+                        │  - Distributes RDMA info    │
+                        └──────────────┬──────────────┘
+                                       │
+                                       ▼
+        ┌──────────────────────────────────────────────────────────────┐
+        │                        Training Nodes                        │
+        │                  (DDP/FSDP: (8,16,24,32) total GPUs)         │
+        │   ┌────────────────────────────────────────────────────────┐ │
+        │   │  - PPO updates                                         │ │
+        │   │  - NCCL intra-node gradient AllReduce                  │ │
+        │   │  - UCCL P2P → RDMA-write weights to inference GPUs     │ │
+        │   └────────────────────────────────────────────────────────┘ │
+        └───────────────────────────────┬──────────────────────────────┘
+                                        │ RDMA (one-sided)
+                                        ▼
+                ┌──────────────────────────────────────────────┐
+                │             Inference Nodes (8 GPUs)         │
+                │  - Receive weights via one-sided RDMA        │
+                │  - Perform rollouts                          │
+                └──────────────────────────────────────────────┘
+
+```
+
 ---
 
-# ⚙️ Installation
+# Installation
 
 ## Requirements
 - RDMA-capable NICs (RoCEv2)  
@@ -90,7 +120,30 @@ Data path: **UCCL RDMA**
 
 ---
 
+# Required Environment Variables
+
+These variables configure both NCCL and UCCL for RDMA-based GPU networking.
+
+```bash
+export NCCL_SOCKET_IFNAME=enp49s0f1np1
+export NCCL_NSOCKS_PERTHREAD=2
+export NCCL_SOCKET_NTHREADS=1
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA='^bnxt_re6'
+export NCCL_IB_GID_INDEX=3
+export UCCL_IB_GID_INDEX=3
+export NCCL_DEBUG=INFO
+```
+
+> **Note:** Replace `enp49s0f1np1` with your cluster-specific NIC interface.
+
+---
+
+
 # Running the System
+```bash
+export MASTER_ADDR=<IP_OF_NODE_0>
+```
 
 ## 1. Take git clone of UCCL Repo and build it 
 ```bash
