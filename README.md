@@ -5,8 +5,9 @@
 This repository contains our implementation of asynchronous RL weight broadcasting using **UCCL RDMA**, comparing:
 
 - **UCCL Collectives**
-- **UCCL P2P (one-sided RDMA writes)**
 - **NCCL Collectives (baseline)**
+- **UCCL P2P (one-sided RDMA writes)**
+
 
 We design a fully distributed reinforcement learning pipeline that integrates **RDMA weight transfer**, **hierarchical collectives**, and a **routing-table–based load balancing algorithm** to achieve **40+ GB/s GPU-to-GPU transfer throughput** across multi-node, multi-GPU clusters.
 
@@ -81,20 +82,20 @@ Data path: **UCCL RDMA**
 # ⚙️ Installation
 
 ## Requirements
-- RDMA-capable NICs (RoCEv2 or InfiniBand)  
+- RDMA-capable NICs (RoCEv2)  
 - GPUs with GPUDirect RDMA  
 - PyTorch w/ NCCL  
-- UCCL + UCS installed  
-- CUDA ≥ 11.4  
+- UCCL built with RoCm  
 - Python ≥ 3.9  
 
 ---
 
 # Running the System
 
-## 1. Navigate to the project directory  
+## 1. Take git clone of UCCL Repo and build it 
 ```bash
-cd rl_weights_rdma/vru/rl-weight-broadcast/controller_approach/
+git clone https://github.com/uccl-project/uccl.git --recursive
+cd uccl && bash build_and_install.sh [cuda|rocm] p2p [py_version]
 ```
 
 ## 2. Source the RDMA environment  
@@ -102,41 +103,14 @@ cd rl_weights_rdma/vru/rl-weight-broadcast/controller_approach/
 source setup_rdma_env.sh
 ```
 
-## 3. Enter the controller approach directory  
+## 3. Enter the directory depending upon p2p/collective
 ```bash
-cd mixed_controller_approach/
+cd uccl_p2p_/
 ```
 ## 4. Execute commands for each node
-Example:
-
-### **Node 0**
 ```bash
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=0 \
-  --master_addr=$MASTER_ADDR --master_port=29501 \
-  main_distributed_rdma_v2.py
+torchrun --nproc_per_node=8 --nnodes=4 --node_rank=0 \ --master_addr=$MASTER_ADDR --master_port=29502 \ main_rdma_rl_qwen_fixed.py \ --model_name=Qwen/Qwen2.5-0.5B \ --num_training=24 \ --num_inference=8
 ```
-
-### **Node 1**
-```bash
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=1 \
-  --master_addr=$MASTER_ADDR --master_port=29501 \
-  main_distributed_rdma_v2.py
-```
-
-### **Node 2**
-```bash
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=2 \
-  --master_addr=$MASTER_ADDR --master_port=29501 \
-  main_distributed_rdma_v2.py
-```
-
-### **Node 3**
-```bash
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=3 \
-  --master_addr=$MASTER_ADDR --master_port=29501 \
-  main_distributed_rdma_v2.py
-```
-
 ---
 
 ---
