@@ -162,7 +162,7 @@ export MASTER_ADDR=<IP_OF_NODE_0>
 ## 1. Take git clone of UCCL Repo and build it 
 ```bash
 git clone https://github.com/uccl-project/uccl.git --recursive
-cd uccl && bash build_and_install.sh [cuda|rocm] p2p [py_version]
+cd uccl && bash build_and_install.sh rocm6 p2p 3.10
 ```
 
 ## 2. Source the RDMA environment  
@@ -172,11 +172,19 @@ source setup_rdma_env.sh
 
 ## 3. Enter the directory depending upon p2p/collective
 ```bash
-cd uccl_p2p_/
+cd uccl_p2p_broadcast_apis/
 ```
 ## 4. Execute commands for each node
 ```bash
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=0 \ --master_addr=$MASTER_ADDR --master_port=29502 \ main_rdma_rl_qwen_fixed.py \ --model_name=Qwen/Qwen2.5-0.5B \ --num_training=24 \ --num_inference=8
+torchrun --nproc_per_node=8 --nnodes=4 --node_rank=$NODE_RANK     --master_addr=$MASTER_ADDR --master_port=29501     uccl_p2p_apis_for_rl_weights_gpt2.py     --num_training=24 --num_inference=8     --rl_iterations=10 --ppo_epochs=4 --rollouts_per_gpu=8
+```
+```bash
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=$NODE_RANK \
+    --master_addr=$MASTER_ADDR --master_port=29501 \
+  uccl_p2p_apis_for_rl_weights_qwen2.5.py \
+    --model_name Qwen/Qwen2.5-0.5B \
+    --num_training=8 --num_inference=8 \
+    --dtype bfloat16
 ```
 ---
 
