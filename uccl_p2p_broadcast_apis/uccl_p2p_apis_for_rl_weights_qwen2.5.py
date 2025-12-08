@@ -1,45 +1,71 @@
-# main_rdma_rl_qwen_fixed.py
+# rl_training_rdma_qwen.py
+"""
+RL Training with RDMA Weight Transfer using UCCL P2P
+Model: Qwen2.5
+- Phase 1: PPO Training on training nodes
+- Phase 2: RDMA weight transfer to inference nodes  
+- Phase 3: Rollout generation on inference nodes
+- Loop back to Phase 1
+"""
+
 import os
 import sys
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
-from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from uccl import p2p
 import time
 import math
+from dataclasses import dataclass
+from typing import List, Tuple
 
 # ============ PARSE ARGUMENTS ============
-parser = argparse.ArgumentParser(description='RL Training with Qwen 2.5 + RDMA Transfer')
+parser = argparse.ArgumentParser(description='RL Training with RDMA Weight Transfer (Qwen2.5)')
 parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B', 
-                    choices=['Qwen/Qwen2.5-0.5B', 'Qwen/Qwen2.5-1.5B', 'Qwen/Qwen2.5-3B', 'Qwen/Qwen2.5-7B'],
-                    help='Qwen 2.5 model variant')
-parser.add_argument('--num_training', type=int, default=24, help='Number of training GPUs')
+                    help='Model name (Qwen/Qwen2.5-0.5B, Qwen/Qwen2.5-1.5B, Qwen/Qwen2.5-7B)')
+parser.add_argument('--num_training', type=int, default=8, help='Number of training GPUs')
 parser.add_argument('--num_inference', type=int, default=8, help='Number of inference GPUs')
 parser.add_argument('--gpus_per_node', type=int, default=8, help='GPUs per node')
 parser.add_argument('--num_shards', type=int, default=8, help='Number of model shards')
-parser.add_argument('--epochs', type=int, default=2, help='Training epochs')
-parser.add_argument('--ppo_epochs', type=int, default=4, help='PPO update epochs per batch')
-parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
-parser.add_argument('--max_length', type=int, default=512, help='Max sequence length')
-parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
-parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
-parser.add_argument('--kl_coef', type=float, default=0.1, help='KL penalty coefficient')
-parser.add_argument('--value_coef', type=float, default=0.5, help='Value loss coefficient')
-parser.add_argument('--use_fp32', action='store_true', help='Use float32 instead of bfloat16')
+parser.add_argument('--rl_iterations', type=int, default=5, help='Number of RL iterations')
+parser.add_argument('--ppo_epochs', type=int, default=4, help='PPO epochs per iteration')
+parser.add_argument('--rollouts_per_gpu', type=int, default=8, help='Rollouts per inference GPU')
+parser.add_argument('--max_gen_length', type=int, default=64, help='Max generation length')
+parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float32', 'float16', 'bfloat16'],
+                    help='Model dtype')
+parser.add_argument('--no_gradient_checkpointing', action='store_true',
+                    help='Disable gradient checkpointing (uses more memory)')
 args = parser.parse_args()
 
 # ============ CONFIGURATION ============
+MODEL_NAME = args.model_name
 NUM_TRAINING_RANKS = args.num_training
 NUM_INFERENCE_RANKS = args.num_inference
 GPUS_PER_NODE = args.gpus_per_node
 NUM_SHARDS = min(args.num_shards, NUM_TRAINING_RANKS, NUM_INFERENCE_RANKS)
+RL_ITERATIONS = args.rl_iterations
+PPO_EPOCHS = args.ppo_epochs
+ROLLOUTS_PER_GPU = args.rollouts_per_gpu
+MAX_GEN_LENGTH = args.max_gen_length
+
+# Dtype
+DTYPE_MAP = {
+    'float32': torch.float32,
+    'float16': torch.float16,
+    'bfloat16': torch.bfloat16
+}
+DTYPE = DTYPE_MAP[args.dtype]
+
+# PPO Hyperparameters
+PPO_CLIP_EPSILON = 0.2
+VALUE_LOSS_COEF = 0.5
+ENTROPY_COEF = 0.01
+LEARNING_RATE = 1e-5
+MAX_GRAD_NORM = 1.0
 
 rank = int(os.environ.get("RANK", 0))
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -50,282 +76,311 @@ INFERENCE_RANKS = list(range(NUM_TRAINING_RANKS, NUM_TRAINING_RANKS + NUM_INFERE
 
 role = "training" if rank in TRAIN_RANKS else "inference"
 
-# Set dtype
-DTYPE = torch.float32 if args.use_fp32 else torch.bfloat16
 
 def log(msg):
     print(f"[Rank {rank}] {msg}", flush=True)
     sys.stdout.flush()
 
-# ============ VALUE HEAD (FIXED DTYPE) ============
+
+# ============ VALUE HEAD ============
 class ValueHead(nn.Module):
-    """Value head for PPO with correct dtype"""
-    def __init__(self, hidden_size, dtype=torch.bfloat16):
+    """Value function head for PPO"""
+    def __init__(self, hidden_size, dtype=torch.float32):
         super().__init__()
-        self.dtype = dtype
-        self.linear1 = nn.Linear(hidden_size, hidden_size // 2)
-        self.relu = nn.ReLU()
-        self.linear2 = nn.Linear(hidden_size // 2, 1)
+        self.dense = nn.Linear(hidden_size, hidden_size, dtype=dtype)
+        self.out = nn.Linear(hidden_size, 1, dtype=dtype)
     
     def forward(self, hidden_states):
-        # Cast input to match weights dtype
-        x = hidden_states.to(self.dtype)
-        x = self.linear1(x)
-        x = self.relu(x)
-        x = self.linear2(x)
-        return x.squeeze(-1)
+        x = self.dense(hidden_states[:, -1, :])
+        x = torch.tanh(x)
+        return self.out(x).squeeze(-1)
 
-# ============ POLICY MODEL WITH VALUE HEAD (FIXED) ============
-class PolicyWithValueHead(nn.Module):
-    """Qwen model with value head for PPO - Fixed for DDP and dtype"""
-    def __init__(self, model_name, device, dtype=torch.bfloat16):
-        super().__init__()
-        self.dtype = dtype
-        self.device = device
-        
-        # Load policy model
-        self.policy = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            trust_remote_code=True
-        ).to(device)
-        
-        # Create value head with matching dtype
-        hidden_size = self.policy.config.hidden_size
-        self.value_head = ValueHead(hidden_size, dtype=dtype).to(device).to(dtype)
-        
-    def forward(self, input_ids, attention_mask=None, return_value=False):
-        outputs = self.policy(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        
-        logits = outputs.logits
-        
-        if return_value:
-            hidden_states = outputs.hidden_states[-1]
-            values = self.value_head(hidden_states)
-            return logits, values
-        
-        return logits
+
+# ============ REWARD FUNCTION ============
+class RewardFunction:
+    """Synthetic reward for RL training"""
     
-    def generate(self, *args, **kwargs):
-        return self.policy.generate(*args, **kwargs)
-
-# ============ PPO TRAINER (FIXED DTYPE) ============
-class PPOTrainer:
-    """PPO Trainer for RL with proper dtype handling"""
-    def __init__(self, model, ref_model, tokenizer, optimizer, args, device, dtype=torch.bfloat16):
-        self.model = model
-        self.ref_model = ref_model
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.optimizer = optimizer
-        self.args = args
-        self.device = device
-        self.dtype = dtype
+    
+    def compute_reward(self, prompt: str, response: str) -> float:
+        rewards = 0.0
+        words = response.split()
         
-    def compute_rewards(self, response_ids, attention_mask):
-        """Compute rewards - simple length-based reward for demo"""
-        batch_size = response_ids.shape[0]
-        rewards = torch.zeros(batch_size, device=self.device, dtype=self.dtype)
+        # Length reward
+        if 10 < len(words) < 50:
+            rewards += 0.3
+        elif len(words) <= 10:
+            rewards += 0.1 * len(words) / 10
         
-        for i in range(batch_size):
-            response_len = attention_mask[i].sum().item()
-            target_len = 100
-            rewards[i] = -abs(response_len - target_len) / target_len + 1.0
+        # No repetition reward
+        if not self._has_repetition(response):
+            rewards += 0.3
+        
+        # Ends with punctuation
+        if response.strip().endswith(('.', '!', '?')):
+            rewards += 0.2
+        
+        # Diversity
+        if len(words) > 0:
+            rewards += 0.2 * len(set(words)) / len(words)
         
         return rewards
     
-    def compute_log_probs(self, logits, labels, attention_mask):
-        """Compute log probabilities of actions"""
-        # Ensure same dtype
-        logits = logits.to(self.dtype)
-        
-        log_probs = torch.log_softmax(logits, dim=-1)
-        
-        shift_log_probs = log_probs[:, :-1, :]
-        shift_labels = labels[:, 1:]
-        shift_mask = attention_mask[:, 1:].to(self.dtype)
-        
-        token_log_probs = torch.gather(
-            shift_log_probs, 
-            dim=-1, 
-            index=shift_labels.unsqueeze(-1)
-        ).squeeze(-1)
-        
-        masked_log_probs = token_log_probs * shift_mask
-        sequence_log_probs = masked_log_probs.sum(dim=-1) / shift_mask.sum(dim=-1).clamp(min=1)
-        
-        return sequence_log_probs
+    def _has_repetition(self, text: str, n: int = 3) -> bool:
+        words = text.lower().split()
+        if len(words) < n * 2:
+            return False
+        ngrams = [tuple(words[i:i+n]) for i in range(len(words) - n + 1)]
+        return len(ngrams) != len(set(ngrams))
+
+
+# ============ ROLLOUT STORAGE ============
+@dataclass
+class RolloutBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    actions: torch.Tensor
+    old_log_probs: torch.Tensor
+    rewards: torch.Tensor
+    values: torch.Tensor
+    advantages: torch.Tensor
+    returns: torch.Tensor
+
+
+# ============ ROLLOUT GENERATOR ============
+class RolloutGenerator:
+    """Generate rollouts for RL training"""
     
-    def compute_kl_divergence(self, logits, ref_logits, attention_mask):
-        """Compute KL divergence between policy and reference"""
-        logits = logits.to(self.dtype)
-        ref_logits = ref_logits.to(self.dtype)
-        attention_mask = attention_mask.to(self.dtype)
+    def __init__(self, model, value_head, tokenizer, reward_fn, device, dtype):
+        self.model = model
+        self.value_head = value_head
+        self.tokenizer = tokenizer
+        self.reward_fn = reward_fn
+        self.device = device
+        self.dtype = dtype
         
-        log_probs = torch.log_softmax(logits, dim=-1)
-        ref_log_probs = torch.log_softmax(ref_logits, dim=-1)
-        
-        # Numerical stability
-        probs = torch.exp(log_probs).clamp(min=1e-8)
-        kl = (probs * (log_probs - ref_log_probs)).sum(dim=-1)
-        kl = (kl * attention_mask).sum(dim=-1) / attention_mask.sum(dim=-1).clamp(min=1)
-        
-        return kl.mean()
+        self.prompts = [
+            "The meaning of life is",
+            "Artificial intelligence will",
+            "The future of technology",
+            "Science has shown that",
+            "In the next decade",
+            "The most important thing",
+            "People often forget that",
+            "History teaches us that",
+            "The key to success is",
+            "Innovation comes from",
+            "The world needs more",
+            "Understanding requires",
+        ]
     
-    def compute_advantages(self, rewards, values, gamma=0.99, lam=0.95):
-        """Compute GAE advantages"""
-        rewards = rewards.to(self.dtype)
-        values = values.to(self.dtype)
+    @torch.no_grad()
+    def generate_rollouts(self, num_rollouts: int, max_length: int = 64) -> RolloutBatch:
+        self.model.eval()
+        if self.value_head is not None:
+            self.value_head.eval()
         
-        advantages = torch.zeros_like(rewards)
-        last_gae = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        all_input_ids = []
+        all_attention_masks = []
+        all_actions = []
+        all_log_probs = []
+        all_rewards = []
+        all_values = []
         
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = torch.tensor(0.0, dtype=self.dtype, device=self.device)
-            else:
-                next_value = values[t + 1]
+        for i in range(num_rollouts):
+            prompt = self.prompts[i % len(self.prompts)]
             
-            delta = rewards[t] + gamma * next_value - values[t]
-            last_gae = delta + gamma * lam * last_gae
-            advantages[t] = last_gae
+            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            prompt_len = input_ids.shape[1]
+            
+            if isinstance(self.model, DDP):
+                model_to_use = self.model.module
+            else:
+                model_to_use = self.model
+            
+            # Generate tokens
+            generated_ids = []
+            log_probs_list = []
+            current_ids = input_ids.clone()
+            current_mask = attention_mask.clone()
+            
+            for _ in range(max_length - prompt_len):
+                with torch.cuda.amp.autocast(dtype=self.dtype):
+                    outputs = model_to_use(
+                        input_ids=current_ids, 
+                        attention_mask=current_mask, 
+                        output_hidden_states=True
+                    )
+                logits = outputs.logits[:, -1, :].float()  # Cast to float for stability
+                
+                # Sample next token
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                next_token_id = next_token.item()
+                
+                # Get log prob
+                log_prob = F.log_softmax(logits, dim=-1)
+                token_log_prob = log_prob[0, next_token_id]
+                
+                # Store
+                generated_ids.append(next_token_id)
+                log_probs_list.append(token_log_prob)
+                
+                # Update
+                current_ids = torch.cat([current_ids, next_token], dim=1)
+                current_mask = torch.cat([current_mask, torch.ones_like(next_token)], dim=1)
+                
+                if next_token_id == self.tokenizer.eos_token_id:
+                    break
+            
+            # Compute value
+            if self.value_head is not None and len(generated_ids) > 0:
+                hidden = outputs.hidden_states[-1]
+                # Cast to match value_head dtype
+                hidden = hidden.to(dtype=next(self.value_head.parameters()).dtype)
+                value = self.value_head(hidden).squeeze()
+            else:
+                value = torch.tensor(0.0, device=self.device)
+            
+            # Compute reward
+            full_text = self.tokenizer.decode(current_ids[0], skip_special_tokens=True)
+            response = full_text[len(prompt):].strip()
+            reward = self.reward_fn.compute_reward(prompt, response)
+            
+            # Create tensors
+            if len(generated_ids) > 0:
+                actions = torch.tensor(generated_ids, device=self.device, dtype=torch.long).unsqueeze(0)
+                total_log_prob = torch.stack(log_probs_list).sum()
+            else:
+                actions = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                total_log_prob = torch.tensor(0.0, device=self.device)
+            
+            all_input_ids.append(current_ids)
+            all_attention_masks.append(current_mask)
+            all_actions.append(actions)
+            all_log_probs.append(total_log_prob)
+            all_rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
+            all_values.append(value.float() if isinstance(value, torch.Tensor) else torch.tensor(value, device=self.device, dtype=torch.float32))
         
-        returns = advantages + values
-        return advantages, returns
-    
-    def ppo_step(self, batch):
-        """Single PPO update step with proper dtype handling"""
-        input_ids = batch['input_ids'].to(self.device)
-        attention_mask = batch['attention_mask'].to(self.device)
+        # Pad sequences
+        max_len = max(ids.shape[1] for ids in all_input_ids)
+        max_action_len = max(a.shape[1] for a in all_actions)
         
-        # Forward pass
-        logits, values = self.model(input_ids, attention_mask, return_value=True)
-        logits = logits.to(self.dtype)
-        values = values.to(self.dtype)
+        padded_input_ids = []
+        padded_attention_masks = []
+        padded_actions = []
         
-        # Reference model forward
-        with torch.no_grad():
-            ref_outputs = self.ref_model(input_ids, attention_mask=attention_mask)
-            ref_logits = ref_outputs.logits.to(self.dtype)
+        for ids, mask, actions in zip(all_input_ids, all_attention_masks, all_actions):
+            pad_len = max_len - ids.shape[1]
+            action_pad_len = max_action_len - actions.shape[1]
+            
+            padded_input_ids.append(F.pad(ids, (0, pad_len), value=self.tokenizer.pad_token_id))
+            padded_attention_masks.append(F.pad(mask, (0, pad_len), value=0))
+            padded_actions.append(F.pad(actions, (0, action_pad_len), value=self.tokenizer.pad_token_id))
         
-        # Compute log probs
-        log_probs = self.compute_log_probs(logits, input_ids, attention_mask)
+        # Stack
+        input_ids = torch.cat(padded_input_ids, dim=0)
+        attention_mask = torch.cat(padded_attention_masks, dim=0)
+        actions = torch.cat(padded_actions, dim=0)
+        old_log_probs = torch.stack(all_log_probs)
+        rewards = torch.stack(all_rewards)
+        values = torch.stack(all_values)
         
-        with torch.no_grad():
-            old_log_probs = self.compute_log_probs(ref_logits, input_ids, attention_mask)
-        
-        # Compute rewards
-        rewards = self.compute_rewards(input_ids, attention_mask)
-        
-        # Compute advantages
-        with torch.no_grad():
-            values_for_gae = values.mean(dim=-1).detach()
-            advantages, returns = self.compute_advantages(rewards, values_for_gae)
+        # Advantages
+        advantages = rewards - values
+        if advantages.std() > 1e-8:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
+        return RolloutBatch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            actions=actions,
+            old_log_probs=old_log_probs,
+            rewards=rewards,
+            values=values,
+            advantages=advantages,
+            returns=rewards
+        )
+
+
+# ============ PPO TRAINER ============
+class PPOTrainer:
+    def __init__(self, model, value_head, optimizer, device, dtype):
+        self.model = model
+        self.value_head = value_head
+        self.optimizer = optimizer
+        self.device = device
+        self.dtype = dtype
+    
+    def ppo_step(self, batch: RolloutBatch) -> dict:
+        input_ids = batch.input_ids.to(self.device)
+        attention_mask = batch.attention_mask.to(self.device)
+        actions = batch.actions.to(self.device)
+        old_log_probs = batch.old_log_probs.to(self.device)
+        advantages = batch.advantages.to(self.device)
+        returns = batch.returns.to(self.device)
+        
+        # Forward with autocast
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            if isinstance(self.model, DDP):
+                outputs = self.model.module(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            else:
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        
+        logits = outputs.logits.float()  # Cast to float for loss computation
+        hidden_states = outputs.hidden_states[-1]
+        # Cast to match value_head dtype
+        hidden_states = hidden_states.to(dtype=next(self.value_head.parameters()).dtype)
+        
+        # New log probs
+        gen_len = actions.shape[1]
+        if gen_len > 0 and logits.shape[1] > gen_len:
+            action_logits = logits[:, -gen_len-1:-1, :]
+            log_probs = F.log_softmax(action_logits, dim=-1)
+            new_log_probs = torch.gather(log_probs, dim=-1, index=actions.unsqueeze(-1)).squeeze(-1)
+            new_log_probs = new_log_probs.sum(dim=-1)
+            entropy = -(F.softmax(action_logits, dim=-1) * log_probs).sum(dim=-1).mean()
+        else:
+            new_log_probs = old_log_probs
+            entropy = torch.tensor(0.0, device=self.device)
+        
+        # Value
+        values = self.value_head(hidden_states).float()  # Cast to float for loss
+        
         # PPO loss
-        ratio = torch.exp(log_probs - old_log_probs)
+        ratio = torch.exp(new_log_probs - old_log_probs)
         surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.args.clip_epsilon, 1 + self.args.clip_epsilon) * advantages
+        surr2 = torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
         
-        # Value loss - ensure same dtype
-        value_pred = values.mean(dim=-1)
-        value_loss = nn.functional.mse_loss(value_pred, returns.to(value_pred.dtype))
+        value_loss = F.mse_loss(values, returns.float())
+        loss = policy_loss + VALUE_LOSS_COEF * value_loss - ENTROPY_COEF * entropy
         
-        # KL penalty
-        kl_loss = self.compute_kl_divergence(logits, ref_logits, attention_mask)
+        self.optimizer.zero_grad()
+        loss.backward()
         
-        # Total loss
-        total_loss = policy_loss + self.args.value_coef * value_loss + self.args.kl_coef * kl_loss
+        if isinstance(self.model, DDP):
+            torch.nn.utils.clip_grad_norm_(self.model.module.parameters(), MAX_GRAD_NORM)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+        torch.nn.utils.clip_grad_norm_(self.value_head.parameters(), MAX_GRAD_NORM)
         
-        return total_loss, {
+        self.optimizer.step()
+        
+        return {
+            'loss': loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'kl_loss': kl_loss.item(),
-            'reward_mean': rewards.float().mean().item()
+            'entropy': entropy.item() if isinstance(entropy, torch.Tensor) else entropy,
+            'approx_kl': ((ratio - 1) - torch.log(ratio)).mean().item()
         }
 
-# ============ PRINT TOPOLOGY ============
-if rank == 0:
-    log("")
-    log("=" * 70)
-    log("              RL TRAINING WITH QWEN 2.5 + RDMA")
-    log("=" * 70)
-    log(f"  Model:               {args.model_name}")
-    log(f"  Total GPUs:          {world_size}")
-    log(f"  Training GPUs:       {NUM_TRAINING_RANKS} (Ranks 0-{NUM_TRAINING_RANKS-1})")
-    log(f"  Inference GPUs:      {NUM_INFERENCE_RANKS} (Ranks {NUM_TRAINING_RANKS}-{NUM_TRAINING_RANKS+NUM_INFERENCE_RANKS-1})")
-    log(f"  Model Shards:        {NUM_SHARDS}")
-    log(f"  Dtype:               {DTYPE}")
-    log(f"  PPO Epochs:          {args.ppo_epochs}")
-    log(f"  Clip Epsilon:        {args.clip_epsilon}")
-    log(f"  KL Coefficient:      {args.kl_coef}")
-    log("=" * 70)
-    log("")
 
-# ============ STEP 1: GLOO INIT ============
-log("Step 1: GLOO init")
-dist.init_process_group(backend="gloo")
-torch.cuda.set_device(local_rank)
-device = f"cuda:{local_rank}"
-
-# ============ STEP 2: LOAD MODEL ============
-log(f"Step 2: Loading {args.model_name}")
-
-tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-if role == "training":
-    # Training: load policy with value head + reference model
-    model = PolicyWithValueHead(args.model_name, device, dtype=DTYPE)
-    
-    # Reference model (frozen)
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=DTYPE,
-        trust_remote_code=True
-    ).to(device)
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
-    
-    log("Policy + Reference models loaded")
-else:
-    # Inference: just load the model
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=DTYPE,
-        trust_remote_code=True
-    ).to(device)
-    ref_model = None
-    log("Inference model loaded")
-
-# Calculate model size
-model_size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-model_size_mb = model_size_bytes / 1e6
-
-if rank == 0:
-    log(f"Model size: {model_size_mb:.2f} MB ({model_size_mb/1e3:.2f} GB)")
-
-# ============ STEP 3: DDP FOR TRAINING ============
-log("Step 3: DDP setup")
-TRAIN_GROUP = None
-
-if rank in TRAIN_RANKS:
-    TRAIN_GROUP = dist.new_group(ranks=TRAIN_RANKS, backend="nccl")
-    model = DDP(model, device_ids=[local_rank], process_group=TRAIN_GROUP, find_unused_parameters=True)
-    log("DDP wrapped")
-
-dist.barrier()
-
-# ============ SHARD MODEL PARAMETERS ============
+# ============ SHARD PARAMETERS ============
 def get_param_shards(model, num_shards):
-    """Split model parameters into shards"""
     if isinstance(model, DDP):
         params = list(model.module.named_parameters())
     else:
@@ -351,7 +406,123 @@ def get_param_shards(model, num_shards):
     
     return shards, shard_sizes
 
-# ============ STEP 4: RDMA SETUP ============
+
+# ============ MAIN ============
+
+# Print topology
+if rank == 0:
+    log("")
+    log("=" * 70)
+    log("         RL TRAINING WITH RDMA WEIGHT TRANSFER (Qwen2.5)")
+    log("=" * 70)
+    log(f"  Model:               {MODEL_NAME}")
+    log(f"  Dtype:               {args.dtype}")
+    log(f"  Total GPUs:          {world_size}")
+    log(f"  Training GPUs:       {NUM_TRAINING_RANKS} (Ranks 0-{NUM_TRAINING_RANKS-1})")
+    log(f"  Inference GPUs:      {NUM_INFERENCE_RANKS} (Ranks {NUM_TRAINING_RANKS}-{NUM_TRAINING_RANKS+NUM_INFERENCE_RANKS-1})")
+    log(f"  RL Iterations:       {RL_ITERATIONS}")
+    log(f"  PPO Epochs:          {PPO_EPOCHS}")
+    log("=" * 70)
+
+# Step 1: GLOO Init
+log("Step 1: GLOO init")
+dist.init_process_group(backend="gloo")
+torch.cuda.set_device(local_rank)
+
+# Step 2: Load Qwen2.5 Model
+log(f"Step 2: Load model ({MODEL_NAME})")
+
+try:
+    # Clear cache before loading
+    torch.cuda.empty_cache()
+    
+    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    
+    # Load model with memory optimizations
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        config=config,
+        torch_dtype=DTYPE,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,  # Reduces CPU memory during loading
+    ).to(f"cuda:{local_rank}")
+    
+    # Enable gradient checkpointing for larger models (saves memory during training)
+    if not args.no_gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        if rank == 0:
+            log("Gradient checkpointing enabled")
+    
+    value_head = ValueHead(config.hidden_size, dtype=DTYPE).to(f"cuda:{local_rank}")
+    
+    # Log memory usage
+    allocated = torch.cuda.memory_allocated(local_rank) / 1e9
+    reserved = torch.cuda.memory_reserved(local_rank) / 1e9
+    log(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+    
+except Exception as e:
+    log(f"ERROR loading model: {e}")
+    import traceback
+    traceback.print_exc()
+    dist.destroy_process_group()
+    sys.exit(1)
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+except Exception as e:
+    log(f"ERROR loading tokenizer: {e}")
+    import traceback
+    traceback.print_exc()
+    dist.destroy_process_group()
+    sys.exit(1)
+
+reward_fn = RewardFunction(tokenizer)
+
+model_size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+model_size_mb = model_size_bytes / 1e6
+model_size_gb = model_size_bytes / 1e9
+
+if rank == 0:
+    log(f"Model size: {model_size_mb:.2f} MB ({model_size_gb:.2f} GB)")
+    log(f"Hidden size: {config.hidden_size}")
+    log(f"Num layers: {config.num_hidden_layers}")
+    log(f"Vocab size: {config.vocab_size}")
+
+# Sync all ranks after model loading to catch OOM errors early
+log("Model loaded, syncing...")
+try:
+    dist.barrier()
+    log("All ranks loaded model successfully")
+except Exception as e:
+    log(f"ERROR during sync after model load: {e}")
+    sys.exit(1)
+
+# Step 3: DDP
+log("Step 3: DDP setup")
+TRAIN_GROUP = None
+
+try:
+    if rank in TRAIN_RANKS:
+        TRAIN_GROUP = dist.new_group(ranks=TRAIN_RANKS, backend="nccl")
+        model = DDP(model, device_ids=[local_rank], process_group=TRAIN_GROUP)
+        log("DDP wrapped")
+    else:
+        log("Inference rank - no DDP")
+    
+    torch.cuda.synchronize()
+    dist.barrier()
+    log("DDP setup complete")
+except Exception as e:
+    log(f"ERROR during DDP setup: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# Step 4: RDMA Setup
 log("Step 4: RDMA setup")
 ep = p2p.Endpoint(local_rank, 4)
 local_metadata = ep.get_metadata()
@@ -361,7 +532,6 @@ log(f"Endpoint: IP={ip}, Port={port}, GPU={gpu}")
 connections = {}
 
 if rank < NUM_SHARDS:
-    # Sender ranks: connect to all inference ranks
     for inf_rank in INFERENCE_RANKS:
         dist.send(torch.ByteTensor(list(local_metadata)), dst=inf_rank)
         remote_tensor = torch.zeros(len(local_metadata), dtype=torch.uint8)
@@ -375,7 +545,6 @@ if rank < NUM_SHARDS:
     log(f"Connected to {len(connections)} inference ranks")
 
 elif rank in INFERENCE_RANKS:
-    # Inference ranks: accept from sender ranks
     for src_rank in range(NUM_SHARDS):
         remote_tensor = torch.zeros(len(local_metadata), dtype=torch.uint8)
         dist.recv(remote_tensor, src=src_rank)
@@ -385,305 +554,299 @@ elif rank in INFERENCE_RANKS:
         if ok:
             connections[src_rank] = conn_id
     log(f"Accepted from {len(connections)} sender ranks")
-
 else:
     log("No RDMA connections (idle during transfer)")
 
 dist.barrier()
 
-# ============ STEP 5: PREPARE DATA ============
-dataloader = None
+# Step 5: Initialize
+optimizer = None
+ppo_trainer = None
+rollout_generator = None
+
 if role == "training":
-    log("Step 5: Prepare RL dataset")
-    
-    dataset = load_dataset("Anthropic/hh-rlhf", split="train")
-    dataset = dataset.select(range(min(1000, len(dataset))))
-    
-    def preprocess(examples):
-        prompts = []
-        for ex in examples["chosen"]:
-            try:
-                prompt = ex.split("Human:")[-1].split("Assistant:")[0].strip()
-                if len(prompt) > 10:
-                    prompts.append(prompt)
-                else:
-                    prompts.append("What is artificial intelligence?")
-            except:
-                prompts.append("What is artificial intelligence?")
-        
-        tokenized = tokenizer(
-            prompts,
-            truncation=True,
-            max_length=args.max_length // 2,
-            padding="max_length"
-        )
-        return tokenized
-    
-    tokenized = dataset.map(preprocess, batched=True, remove_columns=dataset.column_names)
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    
-    sampler = DistributedSampler(tokenized, num_replicas=NUM_TRAINING_RANKS, rank=TRAIN_RANKS.index(rank))
-    dataloader = DataLoader(tokenized, batch_size=args.batch_size, sampler=sampler)
-    log(f"Dataset ready: {len(tokenized)} prompts")
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(value_head.parameters()),
+        lr=LEARNING_RATE
+    )
+    ppo_trainer = PPOTrainer(model, value_head, optimizer, f"cuda:{local_rank}", DTYPE)
+
+if role == "inference":
+    rollout_generator = RolloutGenerator(model, value_head, tokenizer, reward_fn, f"cuda:{local_rank}", DTYPE)
 
 dist.barrier()
 
-# ============ STEP 6: RL TRAINING ============
-total_training_time = 0
-final_reward = 0
-aggregate_bw = 0
-
-if role == "training":
-    if rank == 0:
-        log("")
-        log("=" * 70)
-        log("                    PHASE 1: RL TRAINING (PPO)")
-        log("=" * 70)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    
-    if isinstance(model, DDP):
-        ppo_trainer = PPOTrainer(model.module, ref_model, tokenizer, optimizer, args, device, dtype=DTYPE)
-    else:
-        ppo_trainer = PPOTrainer(model, ref_model, tokenizer, optimizer, args, device, dtype=DTYPE)
-    
-    model.train()
-    training_start = time.perf_counter()
-    
-    global_step = 0
-    epoch_rewards = []
-    
-    for epoch in range(args.epochs):
-        epoch_start = time.perf_counter()
-        dataloader.sampler.set_epoch(epoch)
-        
-        epoch_loss = 0
-        epoch_policy_loss = 0
-        epoch_value_loss = 0
-        epoch_kl_loss = 0
-        epoch_reward = 0
-        epoch_steps = 0
-        
-        for batch in dataloader:
-            for ppo_epoch in range(args.ppo_epochs):
-                optimizer.zero_grad()
-                
-                try:
-                    loss, metrics = ppo_trainer.ppo_step(batch)
-                    
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    
-                    epoch_loss += loss.item()
-                    epoch_policy_loss += metrics['policy_loss']
-                    epoch_value_loss += metrics['value_loss']
-                    epoch_kl_loss += metrics['kl_loss']
-                    epoch_reward += metrics['reward_mean']
-                    epoch_steps += 1
-                except Exception as e:
-                    if rank == 0:
-                        log(f"Warning: PPO step failed: {e}")
-                    continue
-            
-            global_step += 1
-            
-            if global_step % 10 == 0 and rank == 0:
-                avg_reward = epoch_reward / max(epoch_steps, 1)
-                avg_kl = epoch_kl_loss / max(epoch_steps, 1)
-                log(f"Step {global_step}: Reward={avg_reward:.4f}, KL={avg_kl:.4f}")
-        
-        epoch_time = time.perf_counter() - epoch_start
-        avg_loss = epoch_loss / max(epoch_steps, 1)
-        avg_reward = epoch_reward / max(epoch_steps, 1)
-        epoch_rewards.append(avg_reward)
-        
-        if rank == 0:
-            log(f"Epoch {epoch+1}/{args.epochs}: "
-                f"Loss={avg_loss:.4f}, Reward={avg_reward:.4f}, "
-                f"Policy={epoch_policy_loss/max(epoch_steps,1):.4f}, "
-                f"Value={epoch_value_loss/max(epoch_steps,1):.4f}, "
-                f"KL={epoch_kl_loss/max(epoch_steps,1):.4f}, "
-                f"Time={epoch_time:.2f}s")
-    
-    total_training_time = time.perf_counter() - training_start
-    final_reward = epoch_rewards[-1] if epoch_rewards else 0
-    
-    if rank == 0:
-        log("")
-        log(f"RL Training Complete: {total_training_time:.2f}s")
-        log(f"Final Reward: {final_reward:.4f}")
-else:
-    log("Waiting for RL training...")
-
-dist.barrier()
-
-# ============ STEP 7: RDMA WEIGHT TRANSFER ============
-if rank == 0:
-    log("")
-    log("=" * 70)
-    log("                PHASE 2: RDMA WEIGHT TRANSFER")
-    log("=" * 70)
-
+# Get shards
 shards, shard_sizes = get_param_shards(model, num_shards=NUM_SHARDS)
 
+# ============ PRINT ROUTING TABLE ============
 if rank == 0:
     log("")
-    log("Shard Distribution:")
-    log("-" * 50)
-    for i, size in enumerate(shard_sizes):
-        log(f"  Shard {i}: {size/1e6:8.2f} MB")
-    log("-" * 50)
-    log(f"  Total:   {sum(shard_sizes)/1e6:.2f} MB")
+    log("=" * 70)
+    log("                         ROUTING TABLE")
+    log("=" * 70)
     log("")
+    log("  Shard Distribution:")
+    log("  " + "-" * 50)
+    for i, size in enumerate(shard_sizes):
+        log(f"    Shard {i}: {size/1e6:8.2f} MB (Sender: Rank {i})")
+    log("  " + "-" * 50)
+    log(f"    Total Model Size: {sum(shard_sizes)/1e6:.2f} MB ({sum(shard_sizes)/1e9:.2f} GB)")
+    log("")
+    log("  RDMA Connection Mapping (Training → Inference):")
+    log("  " + "-" * 50)
+    for sender_rank in range(NUM_SHARDS):
+        receivers = [f"R{r}" for r in INFERENCE_RANKS]
+        log(f"    Rank {sender_rank} [Shard {sender_rank}] ──► {', '.join(receivers)}")
+    log("  " + "-" * 50)
+    log(f"    Active Senders:    {NUM_SHARDS} (Ranks 0-{NUM_SHARDS-1})")
+    if NUM_TRAINING_RANKS > NUM_SHARDS:
+        log(f"    Idle Training:     {NUM_TRAINING_RANKS - NUM_SHARDS} (Ranks {NUM_SHARDS}-{NUM_TRAINING_RANKS-1})")
+    log(f"    Receivers:         {NUM_INFERENCE_RANKS} (Ranks {INFERENCE_RANKS[0]}-{INFERENCE_RANKS[-1]})")
+    log(f"    Total Connections: {NUM_SHARDS * NUM_INFERENCE_RANKS}")
+    log("=" * 70)
 
-transfer_start = time.perf_counter()
+# Metrics
+total_training_time = 0
+total_transfer_time = 0
+final_reward = 0
 
-if rank < NUM_SHARDS:
-    # Sender
-    my_shard = shards[rank]
-    
-    registered_mrs = {}
-    for name, param in my_shard:
-        tensor = param.data.contiguous()
-        ok, mr_id = ep.reg(tensor.data_ptr(), tensor.numel() * tensor.element_size())
-        if ok:
-            registered_mrs[name] = (mr_id, tensor.data_ptr(), tensor.numel() * tensor.element_size())
-    
-    torch.cuda.synchronize()
-    dist.barrier()
-    
-    t0 = time.perf_counter()
-    total_bytes = 0
-    
-    for inf_rank in INFERENCE_RANKS:
-        conn_id = connections[inf_rank]
-        for name, (mr_id, ptr, size) in registered_mrs.items():
-            ok = ep.send(conn_id, mr_id, ptr, size)
-            if ok:
-                total_bytes += size
-    
-    duration = time.perf_counter() - t0
-    bw = (total_bytes / 1e9) / duration if duration > 0 else 0
-    
-    log(f"UCCL Broadcast Complete. Time: {duration:.4f}s | BW: {bw:.2f} GB/s | "
-        f"Sent: {total_bytes/1e6:.1f} MB to {NUM_INFERENCE_RANKS} receivers")
+# Per-iteration metrics storage
+iter_metrics = []
 
-elif rank in INFERENCE_RANKS:
-    # Receiver
-    registered_mrs = {}
-    for name, param in model.named_parameters():
-        tensor = param.data.contiguous()
-        ok, mr_id = ep.reg(tensor.data_ptr(), tensor.numel() * tensor.element_size())
-        if ok:
-            registered_mrs[name] = (mr_id, tensor.data_ptr(), tensor.numel() * tensor.element_size())
+# ============ MAIN RL LOOP ============
+if rank == 0:
+    log("")
+    log("=" * 70)
+    log("                    STARTING RL TRAINING LOOP")
+    log("=" * 70)
+
+for rl_iter in range(RL_ITERATIONS):
+    iter_start_time = time.perf_counter()
+    iter_training_time = 0
+    iter_transfer_time = 0
+    iter_inference_time = 0
+    iter_reward = 0
+    iter_aggregate_bw = 0
     
-    torch.cuda.synchronize()
-    dist.barrier()
+    if rank == 0:
+        log("")
+        log(f"{'='*70}")
+        log(f"                    RL ITERATION {rl_iter + 1}/{RL_ITERATIONS}")
+        log(f"{'='*70}")
     
-    t0 = time.perf_counter()
-    total_bytes = 0
+    # PHASE 1: PPO Training
+    if rank == 0:
+        log("")
+        log("PHASE 1: PPO TRAINING")
+        log("-" * 50)
     
-    for src_rank in range(NUM_SHARDS):
-        conn_id = connections[src_rank]
-        src_shard = shards[src_rank]
+    if role == "training":
+        model.train()
+        value_head.train()
         
-        for name, _ in src_shard:
-            if name in registered_mrs:
-                mr_id, ptr, size = registered_mrs[name]
-                ok = ep.recv(conn_id, mr_id, ptr, size)
+        rollout_gen = RolloutGenerator(model, value_head, tokenizer, reward_fn, f"cuda:{local_rank}", DTYPE)
+        rollouts = rollout_gen.generate_rollouts(ROLLOUTS_PER_GPU, MAX_GEN_LENGTH)
+        
+        ppo_start = time.perf_counter()
+        
+        for ppo_epoch in range(PPO_EPOCHS):
+            metrics = ppo_trainer.ppo_step(rollouts)
+            
+            if rank == 0:
+                log(f"  PPO Epoch {ppo_epoch + 1}/{PPO_EPOCHS}: "
+                    f"Loss={metrics['loss']:.4f}, Policy={metrics['policy_loss']:.4f}, "
+                    f"Value={metrics['value_loss']:.4f}, KL={metrics['approx_kl']:.4f}")
+        
+        ppo_time = time.perf_counter() - ppo_start
+        total_training_time += ppo_time
+        iter_training_time = ppo_time
+        final_reward = rollouts.rewards.mean().item()
+        iter_reward = final_reward
+        
+        if rank == 0:
+            log(f"  Time: {ppo_time:.2f}s | Reward: {final_reward:.4f}")
+    else:
+        log("Waiting for training...")
+    
+    dist.barrier()
+    
+    # PHASE 2: RDMA Transfer
+    if rank == 0:
+        log("")
+        log("PHASE 2: RDMA WEIGHT TRANSFER")
+        log("-" * 50)
+    
+    transfer_start = time.perf_counter()
+    
+    if rank < NUM_SHARDS:
+        my_shard = shards[rank]
+        
+        registered_mrs = {}
+        for name, param in my_shard:
+            tensor = param.data.contiguous()
+            ok, mr_id = ep.reg(tensor.data_ptr(), tensor.numel() * tensor.element_size())
+            if ok:
+                registered_mrs[name] = (mr_id, tensor.data_ptr(), tensor.numel() * tensor.element_size())
+        
+        torch.cuda.synchronize()
+        dist.barrier()
+        
+        t0 = time.perf_counter()
+        total_bytes = 0
+        
+        for inf_rank in INFERENCE_RANKS:
+            conn_id = connections[inf_rank]
+            for name, (mr_id, ptr, size) in registered_mrs.items():
+                ok = ep.send(conn_id, mr_id, ptr, size)
                 if ok:
                     total_bytes += size
+        
+        duration = time.perf_counter() - t0
+        bw = (total_bytes / 1e9) / duration if duration > 0 else 0
+        log(f"  Sent {total_bytes/1e6:.1f} MB | {duration:.4f}s | {bw:.2f} GB/s")
     
-    duration = time.perf_counter() - t0
-    bw = (total_bytes / 1e9) / duration if duration > 0 else 0
+    elif rank in INFERENCE_RANKS:
+        registered_mrs = {}
+        for name, param in model.named_parameters():
+            tensor = param.data.contiguous()
+            ok, mr_id = ep.reg(tensor.data_ptr(), tensor.numel() * tensor.element_size())
+            if ok:
+                registered_mrs[name] = (mr_id, tensor.data_ptr(), tensor.numel() * tensor.element_size())
+        
+        torch.cuda.synchronize()
+        dist.barrier()
+        
+        t0 = time.perf_counter()
+        total_bytes = 0
+        
+        for src_rank in range(NUM_SHARDS):
+            conn_id = connections[src_rank]
+            src_shard = shards[src_rank]
+            
+            for name, _ in src_shard:
+                if name in registered_mrs:
+                    mr_id, ptr, size = registered_mrs[name]
+                    ok = ep.recv(conn_id, mr_id, ptr, size)
+                    if ok:
+                        total_bytes += size
+        
+        duration = time.perf_counter() - t0
+        bw = (total_bytes / 1e9) / duration if duration > 0 else 0
+        log(f"  Received {total_bytes/1e6:.1f} MB | {duration:.4f}s | {bw:.2f} GB/s")
+    else:
+        torch.cuda.synchronize()
+        dist.barrier()
     
-    log(f"UCCL Receive Complete. Updated Model. Time: {duration:.4f}s | BW: {bw:.2f} GB/s | "
-        f"Received: {total_bytes/1e6:.1f} MB from {NUM_SHARDS} senders")
-
-else:
-    # Idle ranks
-    torch.cuda.synchronize()
     dist.barrier()
-
-dist.barrier()
-transfer_time = time.perf_counter() - transfer_start
-
-if rank == 0:
-    total_data_mb = model_size_mb * NUM_INFERENCE_RANKS
-    aggregate_bw = (total_data_mb / 1e3) / transfer_time if transfer_time > 0 else 0
+    transfer_time = time.perf_counter() - transfer_start
+    total_transfer_time += transfer_time
+    iter_transfer_time = transfer_time
     
-    log("")
-    log("Transfer Summary:")
-    log(f"  Wall Clock:    {transfer_time:.4f}s")
-    log(f"  Aggregate BW:  {aggregate_bw:.2f} GB/s ({aggregate_bw*8:.2f} Gbps)")
-
-# ============ STEP 8: INFERENCE ============
-if role == "inference":
-    if rank == INFERENCE_RANKS[0]:
+    if rank == 0:
+        aggregate_bw = (model_size_mb * NUM_INFERENCE_RANKS / 1e3) / transfer_time if transfer_time > 0 else 0
+        iter_aggregate_bw = aggregate_bw
+        log(f"  Total: {transfer_time:.4f}s | Aggregate: {aggregate_bw:.2f} GB/s")
+    
+    # PHASE 3: Inference
+    if rank == 0:
         log("")
-        log("=" * 70)
-        log("                  PHASE 3: RL-TRAINED INFERENCE")
-        log("=" * 70)
+        log("PHASE 3: INFERENCE")
+        log("-" * 50)
     
-    model.eval()
-    
-    prompts = [
-        "What is the meaning of life?",
-        "How can I improve my productivity?",
-        "Explain quantum computing in simple terms.",
-        "What are the benefits of exercise?"
-    ]
-    
-    inference_start = time.perf_counter()
-    total_tokens = 0
-    
-    for i, prompt in enumerate(prompts):
-        inputs = tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(device)
-        input_len = input_ids.shape[1]
+    if role == "inference":
+        model.eval()
         
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=128,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=tokenizer.eos_token_id
-            )
+        inference_start = time.perf_counter()
+        rollouts = rollout_generator.generate_rollouts(ROLLOUTS_PER_GPU, MAX_GEN_LENGTH)
+        inference_time = time.perf_counter() - inference_start
+        iter_inference_time = inference_time
         
-        tokens = outputs.shape[1] - input_len
-        total_tokens += tokens
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        avg_reward = rollouts.rewards.mean().item()
         
         if rank == INFERENCE_RANKS[0]:
-            log(f"\nPrompt {i+1}: \"{prompt}\"")
-            log(f"Response: {text}")
-            log("-" * 50)
+            log(f"  Rollouts: {ROLLOUTS_PER_GPU} | Time: {inference_time:.2f}s | Reward: {avg_reward:.4f}")
+            sample = tokenizer.decode(rollouts.input_ids[0], skip_special_tokens=True)
+            log(f"  Sample: \"{sample[:100]}...\"")
+    else:
+        log("Waiting for inference...")
     
-    inference_time = time.perf_counter() - inference_start
+    dist.barrier()
     
-    if rank == INFERENCE_RANKS[0]:
-        log(f"\nInference: {inference_time:.2f}s | {total_tokens/inference_time:.1f} tok/s")
+    # Per-iteration summary
+    iter_total_time = time.perf_counter() - iter_start_time
+    
+    if rank == 0:
+        iter_metrics.append({
+            'iteration': rl_iter + 1,
+            'training_time': iter_training_time,
+            'transfer_time': iter_transfer_time,
+            'aggregate_bw': iter_aggregate_bw,
+            'reward': iter_reward,
+            'total_time': iter_total_time
+        })
+        
+        log("")
+        log(f"  ┌{'─'*50}┐")
+        log(f"  │ ITERATION {rl_iter + 1} SUMMARY{' '*32}│")
+        log(f"  ├{'─'*50}┤")
+        log(f"  │  Training Time:      {iter_training_time:>8.2f}s{' '*17}│")
+        log(f"  │  Transfer Time:      {iter_transfer_time:>8.4f}s{' '*17}│")
+        log(f"  │  Aggregate BW:       {iter_aggregate_bw:>8.2f} GB/s{' '*13}│")
+        log(f"  │  Avg Reward:         {iter_reward:>8.4f}{' '*19}│")
+        log(f"  │  Total Iter Time:    {iter_total_time:>8.2f}s{' '*17}│")
+        log(f"  └{'─'*50}┘")
 
-dist.barrier()
-
-# ============ FINAL SUMMARY ============
+# Final Summary
 if rank == 0:
     log("")
     log("=" * 70)
     log("                        FINAL SUMMARY")
     log("=" * 70)
-    log(f"  Model:           {args.model_name}")
-    log(f"  Dtype:           {DTYPE}")
-    log(f"  Training GPUs:   {NUM_TRAINING_RANKS}")
-    log(f"  Inference GPUs:  {NUM_INFERENCE_RANKS}")
+    
+    # Per-iteration metrics table
     log("")
-    log(f"  RL Training:     {total_training_time:.2f}s")
-    log(f"  Final Reward:    {final_reward:.4f}")
-    log(f"  Transfer Time:   {transfer_time:.4f}s")
-    log(f"  Transfer BW:     {aggregate_bw:.2f} GB/s ({aggregate_bw*8:.2f} Gbps)")
+    log("  PER-ITERATION METRICS:")
+    log("  " + "─" * 66)
+    log(f"  │ {'Iter':^4} │ {'Training':^10} │ {'Transfer':^10} │ {'Agg BW':^10} │ {'Reward':^8} │")
+    log(f"  │ {'':^4} │ {'(s)':^10} │ {'(s)':^10} │ {'(GB/s)':^10} │ {'':^8} │")
+    log("  " + "─" * 66)
+    
+    for m in iter_metrics:
+        log(f"  │ {m['iteration']:^4} │ {m['training_time']:^10.2f} │ {m['transfer_time']:^10.4f} │ {m['aggregate_bw']:^10.2f} │ {m['reward']:^8.4f} │")
+    
+    log("  " + "─" * 66)
+    
+    # Averages
+    avg_training = sum(m['training_time'] for m in iter_metrics) / len(iter_metrics)
+    avg_transfer = sum(m['transfer_time'] for m in iter_metrics) / len(iter_metrics)
+    avg_bw = sum(m['aggregate_bw'] for m in iter_metrics) / len(iter_metrics)
+    avg_reward = sum(m['reward'] for m in iter_metrics) / len(iter_metrics)
+    
+    log(f"  │ {'AVG':^4} │ {avg_training:^10.2f} │ {avg_transfer:^10.4f} │ {avg_bw:^10.2f} │ {avg_reward:^8.4f} │")
+    log("  " + "─" * 66)
+    
+    log("")
+    log("  TOTALS:")
+    log("  " + "-" * 50)
+    log(f"    RL Iterations:       {RL_ITERATIONS}")
+    log(f"    Total Training:      {total_training_time:.2f}s")
+    log(f"    Total Transfer:      {total_transfer_time:.4f}s")
+    log(f"    Final Reward:        {final_reward:.4f}")
+    log(f"    Transfer Overhead:   {100 * total_transfer_time / (total_training_time + total_transfer_time + 0.001):.2f}%")
+    log("  " + "-" * 50)
+    log("")
+    log("  CONFIGURATION:")
+    log("  " + "-" * 50)
+    log(f"    Model:               {MODEL_NAME}")
+    log(f"    Model Size:          {model_size_gb:.2f} GB")
+    log(f"    Dtype:               {args.dtype}")
+    log(f"    Training GPUs:       {NUM_TRAINING_RANKS}")
+    log(f"    Inference GPUs:      {NUM_INFERENCE_RANKS}")
+    log(f"    Active Senders:      {NUM_SHARDS}")
+    log(f"    PPO Epochs/Iter:     {PPO_EPOCHS}")
+    log(f"    Rollouts/GPU:        {ROLLOUTS_PER_GPU}")
+    log("  " + "-" * 50)
     log("=" * 70)
 
 dist.destroy_process_group()
