@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export LIBRARY_PATH="/home/yangzhou/miniconda3/envs/rl_rdma_env/lib/python3.10/site-packages/uccl/lib:$LIBRARY_PATH"
+
 # Control-plane TCP NIC (must reach MASTER_ADDR)
 export GLOO_SOCKET_IFNAME=enp49s0f1np1
 export NCCL_SOCKET_IFNAME=enp49s0f1np1
