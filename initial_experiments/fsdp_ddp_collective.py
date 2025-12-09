@@ -70,10 +70,7 @@ class RunConfig:
     def inference_rank(self) -> int:
         return self.train_world_size
 
-
-# ---------------------------------------------------------------------------
 # Logging
-# ---------------------------------------------------------------------------
 def setup_logging(rank: int) -> str:
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -108,9 +105,8 @@ def setup_logging(rank: int) -> str:
     return log_file
 
 
-# ---------------------------------------------------------------------------
+
 # Model + data helpers
-# ---------------------------------------------------------------------------
 def build_model_and_tokenizer(model_key: str, device: torch.device):
     model_key = model_key.lower()
     if model_key.startswith("qwen"):
@@ -179,9 +175,7 @@ def gather_full_state_if_fsdp(model):
         return model.state_dict()
 
 
-# ---------------------------------------------------------------------------
 # Weight transfer helpers
-# ---------------------------------------------------------------------------
 def torch_broadcast_model(model: torch.nn.Module, bridge_group, rank: int, is_sender: bool):
     if bridge_group is None:
         return
@@ -290,9 +284,8 @@ def prepare_sender_model(cfg: RunConfig, model, model_key: str, device: torch.de
     return base_model
 
 
-# ---------------------------------------------------------------------------
+
 # Training / inference
-# ---------------------------------------------------------------------------
 def run_trainer(cfg: RunConfig, rank: int, train_group, bridge_group):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -416,9 +409,8 @@ def run_inference(cfg: RunConfig, rank: int, bridge_group):
         logging.info(f"[INFERENCE EPOCH {epoch}] {generated.replace(chr(10), ' ')}")
 
 
-# ---------------------------------------------------------------------------
+
 # Entry
-# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Unified FSDP/DDP runner for Qwen and RL.")
     p.add_argument("--mode", required=True, choices=["fsdp", "ddp"], help="Training parallelism.")
