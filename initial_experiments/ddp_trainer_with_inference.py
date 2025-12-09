@@ -17,13 +17,11 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 from datasets import load_dataset
 
-# UCCL P2P (same as in gpu_transfer_wikitext2.py)
+
 from uccl import p2p
 
 
-# ---------------------------------------------------------------------------
 # Logging
-# ---------------------------------------------------------------------------
 def setup_logging(rank: int) -> str:
     """
     Configure logging so each rank logs to its own file.
@@ -89,9 +87,8 @@ def log_gpu_info():
     )
 
 
-# ---------------------------------------------------------------------------
+
 # Dataset
-# ---------------------------------------------------------------------------
 def prepare_dataset(tokenizer: GPT2Tokenizer, max_length: int = 128, num_samples: int = 200):
     """
     Load WikiText-2, filter empty lines, take a small subset, and tokenize.
@@ -139,9 +136,8 @@ def prepare_dataset(tokenizer: GPT2Tokenizer, max_length: int = 128, num_samples
     return tokenized
 
 
-# ---------------------------------------------------------------------------
-# UCCL model broadcast helpers (API copied from gpu_transfer_wikitext2.py style)
-# ---------------------------------------------------------------------------
+
+# UCCL model broadcast helpers
 def broadcast_model(ep: p2p.Endpoint, conn_ids, model: nn.Module, rank: int):
     """
     Send model to one or more receivers with detailed logging using UCCL P2P.
@@ -244,9 +240,8 @@ def broadcast_trained_model_uccl(
     logging.info("UCCL broadcast of trained model complete")
 
 
-# ---------------------------------------------------------------------------
+
 # Training Loop
-# ---------------------------------------------------------------------------
 def train_ddp(
     model: nn.Module,
     tokenizer: GPT2Tokenizer,
@@ -387,10 +382,7 @@ def run_quick_inference(model: nn.Module, tokenizer: GPT2Tokenizer, device: torc
     logging.info(f"Output: {generated!r}")
     logging.info("============================================")
 
-
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 def main():
     # Initialize default process group
     dist.init_process_group(backend="nccl", init_method="env://")
@@ -451,7 +443,6 @@ def main():
     if rank == 0:
         run_quick_inference(ddp_model, tokenizer, device)
 
-    # OPTIONAL: UCCL broadcast of trained weights to inference node
     # Enable by setting USE_UCCL_BROADCAST=1 in your environment.
     if os.getenv("USE_UCCL_BROADCAST", "0") == "1":
         broadcast_trained_model_uccl(
