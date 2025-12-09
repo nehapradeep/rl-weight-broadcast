@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
-# ============ PARSE ARGUMENTS ============
+# PARSE ARGUMENTS 
 parser = argparse.ArgumentParser(description='RL Training with RDMA Weight Transfer')
 parser.add_argument('--num_training', type=int, default=8, help='Number of training GPUs')
 parser.add_argument('--num_inference', type=int, default=8, help='Number of inference GPUs')
@@ -34,7 +34,7 @@ parser.add_argument('--rollouts_per_gpu', type=int, default=8, help='Rollouts pe
 parser.add_argument('--max_gen_length', type=int, default=64, help='Max generation length')
 args = parser.parse_args()
 
-# ============ CONFIGURATION ============
+# CONFIGURATION
 NUM_TRAINING_RANKS = args.num_training
 NUM_INFERENCE_RANKS = args.num_inference
 GPUS_PER_NODE = args.gpus_per_node
@@ -66,7 +66,7 @@ def log(msg):
     sys.stdout.flush()
 
 
-# ============ VALUE HEAD ============
+# VALUE HEAD 
 class ValueHead(nn.Module):
     """Value function head for PPO"""
     def __init__(self, hidden_size):
@@ -80,7 +80,7 @@ class ValueHead(nn.Module):
         return self.out(x).squeeze(-1)
 
 
-# ============ REWARD FUNCTION ============
+# REWARD FUNCTION 
 class RewardFunction:
     """Synthetic reward for RL training"""
     
@@ -119,7 +119,7 @@ class RewardFunction:
         return len(ngrams) != len(set(ngrams))
 
 
-# ============ ROLLOUT STORAGE ============
+# ROLLOUT STORAGE 
 @dataclass
 class RolloutBatch:
     input_ids: torch.Tensor
@@ -132,7 +132,7 @@ class RolloutBatch:
     returns: torch.Tensor
 
 
-# ============ ROLLOUT GENERATOR (FIXED) ============
+# ROLLOUT GENERATOR (FIXED)
 class RolloutGenerator:
     """Generate rollouts for RL training"""
     
@@ -286,7 +286,7 @@ class RolloutGenerator:
         )
 
 
-# ============ PPO TRAINER ============
+# PPO TRAINER 
 class PPOTrainer:
     def __init__(self, model, value_head, optimizer, device):
         self.model = model
@@ -355,7 +355,7 @@ class PPOTrainer:
         }
 
 
-# ============ SHARD PARAMETERS ============
+# SHARD PARAMETERS 
 def get_param_shards(model, num_shards):
     if isinstance(model, DDP):
         params = list(model.module.named_parameters())
@@ -383,7 +383,7 @@ def get_param_shards(model, num_shards):
     return shards, shard_sizes
 
 
-# ============ MAIN ============
+# MAIN
 
 # Print topology
 if rank == 0:
@@ -490,7 +490,7 @@ dist.barrier()
 # Get shards
 shards, shard_sizes = get_param_shards(model, num_shards=NUM_SHARDS)
 
-# ============ PRINT ROUTING TABLE ============
+# PRINT ROUTING TABLE
 if rank == 0:
     log("")
     log("=" * 70)
@@ -524,7 +524,7 @@ final_reward = 0
 # Per-iteration metrics storage
 iter_metrics = []
 
-# ============ MAIN RL LOOP ============
+# MAIN RL LOOP
 if rank == 0:
     log("")
     log("=" * 70)
